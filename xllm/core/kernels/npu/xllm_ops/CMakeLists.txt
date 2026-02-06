@@ -9,6 +9,7 @@ cc_library(
   SRCS
     replace_token.cpp
     top_k_top_p.cpp
+    compressor.cpp
     hc_post.cpp
     quant_lightning_indexer.cpp
     hc_pre_inv_rms.cpp

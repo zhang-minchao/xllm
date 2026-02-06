@@ -101,4 +101,26 @@ std::tuple<at::Tensor, at::Tensor> sparse_attn_sharedkv(
     const char* layout_kv = "PA_ND",
     bool return_softmax_lse = false);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+compressor(const at::Tensor& x,
+           const at::Tensor& wkv,
+           const at::Tensor& wgate,
+           at::Tensor& kv_state,
+           at::Tensor& score_state,
+           const at::Tensor& ape,
+           const at::Tensor& norm_weight,
+           const at::Tensor& rope_sin,
+           const at::Tensor& rope_cos,
+           const c10::optional<at::Tensor>& kv_block_table,
+           const c10::optional<at::Tensor>& score_block_table,
+           const c10::optional<at::Tensor>& cu_seqlens,
+           const c10::optional<at::Tensor>& seqused,
+           const c10::optional<at::Tensor>& start_pos,
+           int64_t rope_head_dim,
+           int64_t cmp_ratio,
+           int64_t coff,
+           double norm_eps,
+           int64_t rotary_mode,
+           bool enable_grad);
+
 }  // namespace xllm::kernel::npu
