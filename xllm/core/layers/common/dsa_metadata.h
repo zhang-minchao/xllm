@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace xllm {
@@ -66,6 +68,9 @@ struct DSAMetadata {
   int32_t layer_id = 0;
   // num_speculative_tokens: number of speculative decoding tokens
   int32_t num_speculative_tokens = 0;
+
+  // cp_input_dict: context-parallel inputs placeholder (reserved, optional)
+  std::unordered_map<std::string, torch::Tensor> cp_input_dict;
 
   // RoPE caches (per-position, extracted from dsa_cos_sin table)
   torch::Tensor cos;

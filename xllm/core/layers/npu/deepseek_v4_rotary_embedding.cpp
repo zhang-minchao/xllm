@@ -82,7 +82,7 @@ DeepseekV4RotaryEmbedding::DeepseekV4RotaryEmbedding(
                            mscale_all_dim,
                            original_max_position_embeddings);
 
-  auto compressed_cache =
+  cos_sin_cache_by_group_[kC4Group] =
       create_cos_sin_cache(compress_rope_theta,
                            scaling_factor,
                            extrapolation_factor,
@@ -92,8 +92,16 @@ DeepseekV4RotaryEmbedding::DeepseekV4RotaryEmbedding(
                            mscale,
                            mscale_all_dim,
                            original_max_position_embeddings);
-  cos_sin_cache_by_group_[kC4Group] = compressed_cache;
-  cos_sin_cache_by_group_[kC128Group] = compressed_cache;
+  cos_sin_cache_by_group_[kC128Group] =
+      create_cos_sin_cache(compress_rope_theta,
+                           scaling_factor,
+                           extrapolation_factor,
+                           beta_fast,
+                           beta_slow,
+                           attn_factor,
+                           mscale,
+                           mscale_all_dim,
+                           original_max_position_embeddings);
 }
 
 DeepseekV4RotaryEmbedding::GroupCosSinMap DeepseekV4RotaryEmbedding::build(

@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <tuple>
 #include <unordered_map>
 
@@ -26,7 +27,7 @@ limitations under the License.
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/common/word_embedding.h"
 #include "core/layers/deepseek_v4_decoder_layer.h"
-#include "layers/common/rotary_embedding_util.h"
+#include "layers/npu/deepseek_v4_rotary_embedding.h"
 #include "llm_model_base.h"
 
 namespace xllm {
@@ -94,21 +95,26 @@ class DeepseekV4ModelImpl
       const float attn_factor = model_args.rope_scaling_attn_factor() > 0.0f
                                     ? model_args.rope_scaling_attn_factor()
                                     : 1.0f;
-      dsa_cos_sin_ = layer::rotary::get_deepseek_rotary_embedding(
-          /*head_size=*/model_args.head_dim(),
-          /*rotary_dim=*/rope_head_dim,
-          /*max_position_embeddings=*/max_pos,
-          /*rope_scaling_original_max_position_embeddings=*/original_max_pos,
-          /*rope_theta=*/model_args.rope_theta(),
-          /*interleaved=*/false,
-          /*scaling_factor=*/scaling_factor,
-          /*extrapolation_factor=*/model_args.rope_extrapolation_factor(),
-          /*attn_factor=*/attn_factor,
-          /*beta_fast=*/model_args.beta_fast(),
-          /*beta_slow=*/model_args.beta_slow(),
-          /*mscale=*/model_args.rope_scaling_mscale(),
-          /*mscale_all_dim=*/model_args.rope_scaling_mscale_all_dim(),
-          options);
+      // MindIE alignment: hardcode RoPE theta for DS4.0 DSA path.
+      const float rope_theta = 10000.0f;
+      const float compress_rope_theta = 40000.0f;
+      dsa_rotary_embedding_ =
+          std::make_shared<layer::DeepseekV4RotaryEmbedding>(
+              /*rotary_dim=*/rope_head_dim,
+              /*max_position_embeddings=*/max_pos,
+              /*interleaved=*/false,
+              /*rope_theta=*/rope_theta,
+              /*compress_rope_theta=*/compress_rope_theta,
+              /*scaling_factor=*/scaling_factor,
+              /*extrapolation_factor=*/model_args.rope_extrapolation_factor(),
+              /*beta_fast=*/model_args.beta_fast(),
+              /*beta_slow=*/model_args.beta_slow(),
+              /*attn_factor=*/attn_factor,
+              /*mscale=*/model_args.rope_scaling_mscale(),
+              /*mscale_all_dim=*/model_args.rope_scaling_mscale_all_dim(),
+              /*original_max_position_embeddings=*/original_max_pos,
+              options);
+      dsa_cos_sin_ = dsa_rotary_embedding_->get_cos_sin_cache("default");
     }
 
     for (int32_t i = 0; i < model_args.n_layers(); ++i) {
@@ -223,8 +229,95 @@ class DeepseekV4ModelImpl
     }
     auto& attn_metadata = *(modified_input_params.attn_metadata);
 
+    if (attn_metadata.dsa_metadata) {
+      auto& dsa = *(attn_metadata.dsa_metadata);
+
+      if (dsa_rotary_embedding_) {
+        std::unordered_map<std::string, torch::Tensor> positions_map;
+
+        auto append_group_positions = [&positions_map](
+                                          const std::string& group,
+                                          const torch::Tensor& positions) {
+          if (!positions.defined() || positions.numel() == 0) {
+            return;
+          }
+          auto group_positions = positions;
+          if (group_positions.scalar_type() != torch::kInt64) {
+            group_positions = group_positions.to(torch::kInt64);
+          }
+          positions_map[group] = group_positions;
+        };
+
+        append_group_positions("default", dsa.input_positions);
+        append_group_positions("c4", dsa.c4_pad_positions);
+        append_group_positions("c128", dsa.c128_pad_positions);
+
+        if (!positions_map.empty()) {
+          auto group_cos_sin = dsa_rotary_embedding_->build(positions_map);
+
+          auto default_it = group_cos_sin.find("default");
+          if (default_it != group_cos_sin.end()) {
+            dsa.cos = default_it->second.first;
+            dsa.sin = default_it->second.second;
+          }
+
+          auto c4_it = group_cos_sin.find("c4");
+          if (c4_it != group_cos_sin.end()) {
+            dsa.c4_cos = c4_it->second.first;
+            dsa.c4_sin = c4_it->second.second;
+          }
+
+          auto c128_it = group_cos_sin.find("c128");
+          if (c128_it != group_cos_sin.end()) {
+            dsa.c128_cos = c128_it->second.first;
+            dsa.c128_sin = c128_it->second.second;
+          }
+        }
+      }
+
+      if (dsa.actual_seq_lengths_kv.defined() && dsa.seq_lens_q.defined()) {
+        dsa.start_pos =
+            (dsa.actual_seq_lengths_kv - dsa.seq_lens_q).to(torch::kInt32);
+      }
+    }
+
     std::optional<torch::Tensor> residual;
     for (size_t i = 0; i < layers_.size(); i++) {
+      if (attn_metadata.dsa_metadata) {
+        auto& dsa = *(attn_metadata.dsa_metadata);
+        const int32_t layer_id = static_cast<int32_t>(i);
+        dsa.layer_id = layer_id;
+
+        if (layer_id < static_cast<int32_t>(dsa.block_tables.size()) &&
+            layer_id < static_cast<int32_t>(dsa.slot_mappings.size()) &&
+            !dsa.block_tables[layer_id].empty() &&
+            !dsa.slot_mappings[layer_id].empty()) {
+          size_t attn_cache_idx = 0;
+          if (layer_id < static_cast<int32_t>(caches_info_.size())) {
+            const auto& layer_caches = caches_info_[layer_id];
+            for (size_t cache_idx = 0; cache_idx < layer_caches.size();
+                 ++cache_idx) {
+              if (layer_caches[cache_idx].type ==
+                  DSACacheType::SLIDING_WINDOW) {
+                attn_cache_idx = cache_idx;
+                break;
+              }
+            }
+          }
+
+          if (attn_cache_idx < dsa.block_tables[layer_id].size() &&
+              dsa.block_tables[layer_id][attn_cache_idx].defined()) {
+            attn_metadata.block_table =
+                dsa.block_tables[layer_id][attn_cache_idx];
+          }
+          if (attn_cache_idx < dsa.slot_mappings[layer_id].size() &&
+              dsa.slot_mappings[layer_id][attn_cache_idx].defined()) {
+            attn_metadata.slot_mapping =
+                dsa.slot_mappings[layer_id][attn_cache_idx];
+          }
+        }
+      }
+
       h = layers_[i](h,
                      residual,
                      positions,
@@ -250,6 +343,7 @@ class DeepseekV4ModelImpl
   }
 
   torch::Tensor dsa_cos_sin_;
+  std::shared_ptr<layer::DeepseekV4RotaryEmbedding> dsa_rotary_embedding_;
 
   int64_t hc_mult_ = 1;
   double hc_eps_ = 0.0;

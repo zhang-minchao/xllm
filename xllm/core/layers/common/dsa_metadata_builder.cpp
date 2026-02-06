@@ -30,16 +30,36 @@ AttentionMetadata DSAMetadataBuilder::build(
     const torch::Tensor& positions,
     const torch::Tensor& dsa_cos_sin,
     const std::vector<std::vector<DSACacheInfo>>& caches_info,
-    const std::vector<DSAGroupInfo>& group_infos) {
+    const std::vector<DSAGroupInfo>& group_infos,
+    const torch::Tensor& dsa_c4_cos_sin,
+    const torch::Tensor& dsa_c128_cos_sin) {
   // 1. Build base AttentionMetadata (q_cu_seq_lens, block_table, etc.)
   AttentionMetadata attn_metadata = AttentionMetadataBuilder::build(params);
 
   // 2. Build DSA-specific fields
   auto dsa_metadata = std::make_shared<DSAMetadata>();
-  build_dsa_fields(
-      params, positions, dsa_cos_sin, caches_info, group_infos, *dsa_metadata);
+  build_dsa_fields(params,
+                   positions,
+                   dsa_cos_sin,
+                   dsa_c4_cos_sin,
+                   dsa_c128_cos_sin,
+                   caches_info,
+                   group_infos,
+                   *dsa_metadata);
 
-  // 3. Attach to AttentionMetadata
+  // 3. Keep DSA metadata independent while syncing base attention tensors.
+  if (attn_metadata.attn_mask.defined()) {
+    dsa_metadata->attn_mask = attn_metadata.attn_mask.clone();
+  }
+
+  if (attn_metadata.mrope_cos.defined() && !dsa_metadata->cos_table.defined()) {
+    dsa_metadata->cos_table = attn_metadata.mrope_cos;
+  }
+  if (attn_metadata.mrope_sin.defined() && !dsa_metadata->sin_table.defined()) {
+    dsa_metadata->sin_table = attn_metadata.mrope_sin;
+  }
+
+  // 4. Attach to AttentionMetadata
   attn_metadata.dsa_metadata = std::move(dsa_metadata);
 
   return attn_metadata;
@@ -49,37 +69,40 @@ void DSAMetadataBuilder::build_dsa_fields(
     const ModelInputParams& params,
     const torch::Tensor& positions,
     const torch::Tensor& dsa_cos_sin,
+    const torch::Tensor& dsa_c4_cos_sin,
+    const torch::Tensor& dsa_c128_cos_sin,
     const std::vector<std::vector<DSACacheInfo>>& caches_info,
     const std::vector<DSAGroupInfo>& group_infos,
     DSAMetadata& dsa) {
-  // --- Base attention fields replicated into DSAMetadata ---
-  // seq_lens: kv sequence lengths from params
-  dsa.seq_lens =
-      torch::tensor(std::vector<int32_t>(params.kv_seq_lens_vec.begin(),
-                                         params.kv_seq_lens_vec.end()),
-                    torch::kInt32);
+  const int32_t batch_size =
+      static_cast<int32_t>(params.kv_seq_lens_vec.size());
 
-  // --- RoPE cos/sin extraction ---
-  if (dsa_cos_sin.defined() && positions.defined()) {
-    torch::Tensor cos_sin = dsa_cos_sin;
-    if (cos_sin.device() != positions.device()) {
-      cos_sin = cos_sin.to(positions.device());
-    }
-    auto target = cos_sin.index({positions});
-    auto chunks = target.chunk(/*chunks=*/2, /*dim=*/-1);
-    dsa.cos = chunks[0].contiguous();
-    dsa.sin = chunks[1].contiguous();
+  dsa.input_positions = positions;
+
+  // Build per-batch sequence length metadata.
+  build_seq_lengths(params, batch_size, dsa);
+
+  // Keep base RoPE tables in metadata. Per-forward cos/sin slices are
+  // calculated in DeepseekV4ModelImpl::forward to align with MindIE timing.
+  if (dsa_cos_sin.defined()) {
+    auto cos_sin_chunks = dsa_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
+    dsa.cos_table = cos_sin_chunks[0].contiguous();
+    dsa.sin_table = cos_sin_chunks[1].contiguous();
   }
+
+  if (positions.defined()) {
+    const int64_t total_tokens = positions.numel();
+    build_positions(params, batch_size, total_tokens, dsa);
+  }
+
+  (void)dsa_c4_cos_sin;
+  (void)dsa_c128_cos_sin;
 
   // --- Block tables / slots expansion ---
   if (!params.multi_block_tables.empty() && !caches_info.empty()) {
-    dsa.input_positions = positions;
-
     const int32_t manager_num =
         static_cast<int32_t>(params.multi_block_tables.size());
     const int32_t n_layers = static_cast<int32_t>(caches_info.size());
-    const int32_t batch_size =
-        static_cast<int32_t>(params.kv_seq_lens_vec.size());
     const auto& ctx_lens = params.kv_seq_lens_vec;
     int64_t total_tokens = 0;
     for (auto len : ctx_lens) total_tokens += len;
@@ -123,16 +146,10 @@ void DSAMetadataBuilder::build_dsa_fields(
         }
       }
     }
-
-    // Build actual_seq_lengths_kv and actual_seq_lengths_query
-    build_seq_lengths(params, batch_size, dsa);
-
-    // Build compressed positions (c4/c128)
-    build_positions(params, batch_size, total_tokens, dsa);
-
-    // Attach cache spec pointer
-    dsa.caches_info = &caches_info;
   }
+
+  // Attach cache spec pointer
+  dsa.caches_info = &caches_info;
 }
 
 torch::Tensor DSAMetadataBuilder::expand_blocks_to_slots(
@@ -278,6 +295,7 @@ void DSAMetadataBuilder::build_seq_lengths(const ModelInputParams& params,
       torch::tensor(std::vector<int32_t>(params.kv_seq_lens_vec.begin(),
                                          params.kv_seq_lens_vec.end()),
                     torch::kInt32);
+  dsa_metadata.seq_lens = kv_lens;
   dsa_metadata.actual_seq_lengths_kv = kv_lens;
 
   torch::Tensor q_lens;
@@ -292,12 +310,28 @@ void DSAMetadataBuilder::build_seq_lengths(const ModelInputParams& params,
   auto cumsum = torch::cumsum(q_lens, /*dim=*/0, /*dtype=*/torch::kInt32);
   dsa_metadata.actual_seq_lengths_query =
       torch::cat({torch::zeros({1}, torch::kInt32), cumsum});
+  dsa_metadata.seq_lens_q = q_lens;
+
+  auto int_options = torch::TensorOptions().dtype(torch::kInt32);
+  if (kv_lens.numel() > 0) {
+    dsa_metadata.max_seqlen_kv = torch::max(kv_lens).to(torch::kInt32);
+  } else {
+    dsa_metadata.max_seqlen_kv = torch::zeros({1}, int_options);
+  }
+
+  if (q_lens.numel() > 0) {
+    dsa_metadata.max_seqlen_q = torch::max(q_lens).to(torch::kInt32);
+  } else {
+    dsa_metadata.max_seqlen_q = torch::zeros({1}, int_options);
+  }
 }
 
 void DSAMetadataBuilder::build_positions(const ModelInputParams& params,
                                          int32_t batch_size,
                                          int64_t total_tokens,
                                          DSAMetadata& dsa_metadata) {
+  (void)params;
+  (void)total_tokens;
   if (!dsa_metadata.input_positions.defined()) return;
 
   auto input_positions = dsa_metadata.input_positions;
@@ -328,6 +362,31 @@ void DSAMetadataBuilder::build_positions(const ModelInputParams& params,
   } else {
     dsa_metadata.c128_pad_positions = c128_pos.slice(0, 0, c128_target);
   }
+}
+
+void DSAMetadataBuilder::build_group_cos_sin(const torch::Tensor& cos_sin_table,
+                                             const torch::Tensor& pad_positions,
+                                             torch::Tensor& out_cos,
+                                             torch::Tensor& out_sin) {
+  if (!cos_sin_table.defined() || !pad_positions.defined() ||
+      pad_positions.numel() == 0) {
+    return;
+  }
+
+  auto group_positions = pad_positions;
+  if (group_positions.scalar_type() != torch::kInt64) {
+    group_positions = group_positions.to(torch::kInt64);
+  }
+
+  auto group_table = cos_sin_table;
+  if (group_table.device() != group_positions.device()) {
+    group_table = group_table.to(group_positions.device());
+  }
+
+  auto target = group_table.index({group_positions});
+  auto chunks = target.chunk(/*chunks=*/2, /*dim=*/-1);
+  out_cos = chunks[0].contiguous();
+  out_sin = chunks[1].contiguous();
 }
 
 }  // namespace xllm::layer

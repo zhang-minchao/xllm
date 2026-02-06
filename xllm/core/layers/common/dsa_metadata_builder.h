@@ -50,7 +50,9 @@ class DSAMetadataBuilder {
       const torch::Tensor& positions,
       const torch::Tensor& dsa_cos_sin,
       const std::vector<std::vector<DSACacheInfo>>& caches_info,
-      const std::vector<DSAGroupInfo>& group_infos);
+      const std::vector<DSAGroupInfo>& group_infos,
+      const torch::Tensor& dsa_c4_cos_sin = torch::Tensor(),
+      const torch::Tensor& dsa_c128_cos_sin = torch::Tensor());
 
  private:
   // Build DSA-specific fields into dsa_metadata.
@@ -58,6 +60,8 @@ class DSAMetadataBuilder {
       const ModelInputParams& params,
       const torch::Tensor& positions,
       const torch::Tensor& dsa_cos_sin,
+      const torch::Tensor& dsa_c4_cos_sin,
+      const torch::Tensor& dsa_c128_cos_sin,
       const std::vector<std::vector<DSACacheInfo>>& caches_info,
       const std::vector<DSAGroupInfo>& group_infos,
       DSAMetadata& dsa_metadata);
@@ -108,6 +112,12 @@ class DSAMetadataBuilder {
                               int32_t batch_size,
                               int64_t total_tokens,
                               DSAMetadata& dsa_metadata);
+
+  // Build grouped RoPE slices (c4/c128) from position IDs.
+  static void build_group_cos_sin(const torch::Tensor& cos_sin_table,
+                                  const torch::Tensor& pad_positions,
+                                  torch::Tensor& out_cos,
+                                  torch::Tensor& out_sin);
 };
 
 }  // namespace layer
