@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <tuple>
+
 namespace xllm::kernel::npu {
 
 void beam_search(const torch::Tensor& logprobs,
@@ -57,5 +59,46 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
     int64_t next_tokens,
     int64_t cmp_ratio,
     bool return_value);
+at::Tensor hc_pre_inv_rms(const at::Tensor& x, double epsilon = 1e-6);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
+    const at::Tensor& x,
+    const c10::optional<at::Tensor>& bias = c10::nullopt,
+    const c10::optional<at::Tensor>& input_ids = c10::nullopt,
+    const c10::optional<at::Tensor>& tid2eid = c10::nullopt,
+    int64_t k = 1,
+    int64_t k_group = 1,
+    int64_t group_count = 1,
+    int64_t group_select_mode = 0,
+    int64_t renorm = 0,
+    int64_t norm_type = 0,
+    bool out_flag = false,
+    double routed_scaling_factor = 1.0,
+    double eps = 1e-20);
+
+std::tuple<at::Tensor, at::Tensor> sparse_attn_sharedkv(
+    const at::Tensor& q,
+    const c10::optional<at::Tensor>& ori_kv = c10::nullopt,
+    const c10::optional<at::Tensor>& cmp_kv = c10::nullopt,
+    const c10::optional<at::Tensor>& ori_sparse_indices = c10::nullopt,
+    const c10::optional<at::Tensor>& cmp_sparse_indices = c10::nullopt,
+    const c10::optional<at::Tensor>& ori_block_table = c10::nullopt,
+    const c10::optional<at::Tensor>& cmp_block_table = c10::nullopt,
+    const c10::optional<at::Tensor>& cu_seqlens_q = c10::nullopt,
+    const c10::optional<at::Tensor>& cu_seqlens_ori_kv = c10::nullopt,
+    const c10::optional<at::Tensor>& cu_seqlens_cmp_kv = c10::nullopt,
+    const c10::optional<at::Tensor>& seqused_q = c10::nullopt,
+    const c10::optional<at::Tensor>& seqused_kv = c10::nullopt,
+    const c10::optional<at::Tensor>& sinks = c10::nullopt,
+    const c10::optional<at::Tensor>& metadata = c10::nullopt,
+    double softmax_scale = 1.0,
+    int64_t cmp_ratio = 1,
+    int64_t ori_mask_mode = 3,
+    int64_t cmp_mask_mode = 3,
+    int64_t ori_win_left = 128,
+    int64_t ori_win_right = 0,
+    const char* layout_q = "BSND",
+    const char* layout_kv = "PA_ND",
+    bool return_softmax_lse = false);
 
 }  // namespace xllm::kernel::npu

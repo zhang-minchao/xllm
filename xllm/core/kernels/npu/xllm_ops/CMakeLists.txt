@@ -11,6 +11,9 @@ cc_library(
     top_k_top_p.cpp
     hc_post.cpp
     quant_lightning_indexer.cpp
+    hc_pre_inv_rms.cpp
+    moe_gating_top_k_hash.cpp
+    sparse_attn_sharedkv.cpp
     ../utils.cpp
     beam_search.cpp
   DEPS
