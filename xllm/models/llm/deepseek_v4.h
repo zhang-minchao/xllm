@@ -21,7 +21,8 @@ limitations under the License.
 #include <unordered_map>
 
 #include "core/framework/state_dict/utils.h"
-#include "core/layers/common/attention_metadata_builder.h"
+#include "core/layers/common/dsa_metadata.h"
+#include "core/layers/common/dsa_metadata_builder.h"
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/common/word_embedding.h"
 #include "core/layers/deepseek_v4_decoder_layer.h"
@@ -29,21 +30,6 @@ limitations under the License.
 #include "llm_model_base.h"
 
 namespace xllm {
-
-// DSA cache type enum for DeepSeek V4 multi-cache management
-enum class DSACacheType : int32_t {
-  TOKEN = 0,           // block allocated by token count / ratio
-  SEQUENCE = 1,        // one block per sequence
-  SLIDING_WINDOW = 2,  // sliding window, fixed number of blocks per seq
-};
-
-// Per-cache metadata within a layer
-struct DSACacheInfo {
-  int32_t group_id;    // which block manager group this cache belongs to
-  DSACacheType type;   // cache type
-  int32_t ratio;       // compression ratio
-  int32_t block_size;  // block size for this cache
-};
 
 // Group key: (ratio, type, block_size) -> group_id
 struct DSAGroupKey {
@@ -62,13 +48,6 @@ struct DSAGroupKeyHash {
     h ^= std::hash<int32_t>()(k.block_size) << 8;
     return h;
   }
-};
-
-// Group-level info
-struct DSAGroupInfo {
-  DSACacheType type;
-  int32_t ratio;
-  int32_t block_size;
 };
 
 class DeepseekV4ModelImpl
@@ -236,30 +215,13 @@ class DeepseekV4ModelImpl
     if (!modified_input_params.attn_metadata) {
       modified_input_params.attn_metadata =
           std::make_shared<layer::AttentionMetadata>(
-              layer::AttentionMetadataBuilder::build(modified_input_params));
+              layer::DSAMetadataBuilder::build(modified_input_params,
+                                               positions,
+                                               dsa_cos_sin_,
+                                               caches_info_,
+                                               group_infos_));
     }
     auto& attn_metadata = *(modified_input_params.attn_metadata);
-
-    if (dsa_cos_sin_.defined() && positions.defined()) {
-      torch::Tensor cos_sin = dsa_cos_sin_;
-      if (cos_sin.device() != positions.device()) {
-        cos_sin = cos_sin.to(positions.device());
-      }
-      auto target = cos_sin.index({positions});
-      auto chunks = target.chunk(/*chunks=*/2, /*dim=*/-1);
-      attn_metadata.dsa_cos = chunks[0].contiguous();
-      attn_metadata.dsa_sin = chunks[1].contiguous();
-    }
-
-    // Build DSA per-layer block_tables and slot_mappings from
-    // multi_block_tables (block -> slot expansion, layer expansion,
-    // processing).
-    if (!modified_input_params.multi_block_tables.empty() &&
-        !caches_info_.empty()) {
-      // Set input_positions for c4/c128 compressed RoPE computation
-      attn_metadata.dsa_input_positions = positions;
-      build_dsa_metadata(modified_input_params, attn_metadata);
-    }
 
     std::optional<torch::Tensor> residual;
     for (size_t i = 0; i < layers_.size(); i++) {
@@ -285,287 +247,6 @@ class DeepseekV4ModelImpl
     auto pre = torch::sigmoid(mixes * hc_head_scale_ + hc_head_base_) + hc_eps_;
     auto y = (pre.unsqueeze(-1) * x_float).sum(-2);
     return y.to(x.dtype());
-  }
-
-  // Build DSA block_tables and slot_mappings per layer per cache.
-  //   Step 1: block -> slot expansion per manager
-  //   Step 2: per-group processing (TOKEN sort+truncate / SWA left-pad)
-  //   Step 3: expand manager-level to [layer][cache] using group_id
-  void build_dsa_metadata(const ModelInputParams& params,
-                          layer::AttentionMetadata& attn_metadata) const {
-    const int32_t manager_num =
-        static_cast<int32_t>(params.multi_block_tables.size());
-    const int32_t n_layers = static_cast<int32_t>(caches_info_.size());
-    const int32_t batch_size =
-        static_cast<int32_t>(params.kv_seq_lens_vec.size());
-    const auto& ctx_lens = params.kv_seq_lens_vec;
-    int64_t total_tokens = 0;
-    for (auto len : ctx_lens) total_tokens += len;
-
-    // Step 1: block -> slot expansion per manager
-    std::vector<torch::Tensor> mgr_slots(manager_num);
-    for (int32_t m = 0; m < manager_num; ++m) {
-      mgr_slots[m] = expand_blocks_to_slots(params.multi_block_tables[m],
-                                            group_infos_[m],
-                                            ctx_lens,
-                                            batch_size,
-                                            total_tokens);
-    }
-
-    // Step 2: per-group processing (done once per group, shared across layers)
-    std::vector<torch::Tensor> proc_slots(manager_num);
-    std::vector<torch::Tensor> proc_bt(manager_num);
-    for (int32_t m = 0; m < manager_num; ++m) {
-      process_group(params.multi_block_tables[m],
-                    mgr_slots[m],
-                    group_infos_[m],
-                    ctx_lens,
-                    batch_size,
-                    total_tokens,
-                    proc_bt[m],
-                    proc_slots[m]);
-    }
-
-    // Step 3: expand by layer using group_id
-    attn_metadata.dsa_block_tables.resize(n_layers);
-    attn_metadata.dsa_slot_mappings.resize(n_layers);
-    for (int32_t lid = 0; lid < n_layers; ++lid) {
-      const auto& lci = caches_info_[lid];
-      attn_metadata.dsa_block_tables[lid].resize(lci.size());
-      attn_metadata.dsa_slot_mappings[lid].resize(lci.size());
-      for (size_t ci = 0; ci < lci.size(); ++ci) {
-        int32_t gid = lci[ci].group_id;
-        if (gid < manager_num) {
-          attn_metadata.dsa_block_tables[lid][ci] = proc_bt[gid];
-          attn_metadata.dsa_slot_mappings[lid][ci] = proc_slots[gid];
-        }
-      }
-    }
-
-    // Build actual_seq_lengths_kv and actual_seq_lengths_query
-    build_dsa_seq_lengths(params, batch_size, attn_metadata);
-
-    // Build compressed positions (c4/c128) and input_positions
-    build_dsa_positions(params, batch_size, total_tokens, attn_metadata);
-
-    // Attach cache spec pointer
-    attn_metadata.dsa_caches_info = &caches_info_;
-  }
-
-  // Step 1: expand block_table to slot array for one manager.
-  // slot_id = block_id * block_size + offset
-  // Returns tensor of shape (total_tokens,), unfilled positions are -1.
-  static torch::Tensor expand_blocks_to_slots(const torch::Tensor& block_table,
-                                              const DSAGroupInfo& gi,
-                                              const std::vector<int>& ctx_lens,
-                                              int32_t batch_size,
-                                              int64_t total_tokens) {
-    const int32_t bs = gi.block_size;
-    auto slots = torch::full({total_tokens}, -1, torch::kInt32);
-    auto slots_acc = slots.accessor<int32_t, 1>();
-    auto bt_acc = block_table.accessor<int32_t, 2>();
-    const int32_t max_blocks = block_table.size(1);
-
-    int64_t start_idx = 0;
-    for (int32_t seq = 0; seq < batch_size; ++seq) {
-      int64_t token_len = ctx_lens[seq];
-      int64_t slot_num = compute_slot_num(gi, token_len);
-
-      int64_t filled = 0;
-      for (int32_t blk = 0; blk < max_blocks && filled < slot_num; ++blk) {
-        int32_t block_id = bt_acc[seq][blk];
-        if (block_id < 0) break;
-        for (int32_t off = 0; off < bs && filled < slot_num; ++off) {
-          slots_acc[start_idx + filled] =
-              static_cast<int32_t>(static_cast<int64_t>(block_id) * bs + off);
-          ++filled;
-        }
-      }
-      start_idx += token_len;
-    }
-    return slots;
-  }
-
-  // Compute how many slots a single seq needs for this group.
-  static int64_t compute_slot_num(const DSAGroupInfo& gi, int64_t token_len) {
-    if (gi.type == DSACacheType::TOKEN) {
-      return token_len / gi.ratio;
-    }
-    // SLIDING_WINDOW
-    const int32_t bs = gi.block_size;
-    if (token_len > bs) {
-      return token_len % bs + bs;
-    }
-    int64_t n = token_len % bs;
-    return (n == 0 && token_len > 0) ? bs : n;
-  }
-
-  // Step 2: per-group processing.
-  // TOKEN:  sort slots (valid first), truncate, replace -1 with 0.
-  //         block_tables unchanged.
-  // SWA:    replace -1 with 0 in slots.
-  //         left-pad block_tables with 0.
-  static void process_group(const torch::Tensor& raw_bt,
-                            const torch::Tensor& raw_slots,
-                            const DSAGroupInfo& gi,
-                            const std::vector<int>& ctx_lens,
-                            int32_t batch_size,
-                            int64_t total_tokens,
-                            torch::Tensor& out_bt,
-                            torch::Tensor& out_slots) {
-    if (gi.type == DSACacheType::TOKEN) {
-      process_token_group(raw_bt,
-                          raw_slots,
-                          gi.ratio,
-                          batch_size,
-                          total_tokens,
-                          out_bt,
-                          out_slots);
-    } else if (gi.type == DSACacheType::SLIDING_WINDOW) {
-      process_swa_group(raw_bt,
-                        raw_slots,
-                        gi.block_size,
-                        ctx_lens,
-                        batch_size,
-                        out_bt,
-                        out_slots);
-    } else {
-      out_slots = torch::where(
-          raw_slots.eq(-1), torch::zeros_like(raw_slots), raw_slots);
-      out_bt = raw_bt;
-    }
-  }
-
-  // TOKEN group: sort slots (valid first, -1 last), truncate, -1 -> 0.
-  static void process_token_group(const torch::Tensor& raw_bt,
-                                  const torch::Tensor& raw_slots,
-                                  int32_t ratio,
-                                  int32_t batch_size,
-                                  int64_t total_tokens,
-                                  torch::Tensor& out_bt,
-                                  torch::Tensor& out_slots) {
-    int64_t op_need_length = std::min(
-        total_tokens / ratio + static_cast<int64_t>(batch_size), total_tokens);
-    auto sort_key = torch::where(raw_slots.eq(-1),
-                                 torch::ones_like(raw_slots),
-                                 torch::zeros_like(raw_slots));
-    auto sorted_idx =
-        sort_key.argsort(/*dim=*/0, /*descending=*/false, /*stable=*/true);
-    auto slots = raw_slots.index_select(0, sorted_idx)
-                     .slice(/*dim=*/0, /*start=*/0, /*end=*/op_need_length)
-                     .contiguous();
-    out_slots = torch::where(slots.eq(-1), torch::zeros_like(slots), slots);
-    out_bt = raw_bt;  // keep original right-padded block_tables
-  }
-
-  // SWA group: replace -1 with 0 in slots; left-pad block_tables.
-  static void process_swa_group(const torch::Tensor& raw_bt,
-                                const torch::Tensor& raw_slots,
-                                int32_t block_size,
-                                const std::vector<int>& ctx_lens,
-                                int32_t batch_size,
-                                torch::Tensor& out_bt,
-                                torch::Tensor& out_slots) {
-    out_slots =
-        torch::where(raw_slots.eq(-1), torch::zeros_like(raw_slots), raw_slots);
-
-    int32_t current_cols = raw_bt.size(1);
-    int32_t max_dst_len = 0;
-    std::vector<int32_t> dst_lens(batch_size);
-    for (int32_t s = 0; s < batch_size; ++s) {
-      dst_lens[s] = static_cast<int32_t>(
-          std::ceil(static_cast<double>(ctx_lens[s]) / block_size));
-      max_dst_len = std::max(max_dst_len, dst_lens[s]);
-    }
-    max_dst_len = std::max(max_dst_len, current_cols);
-
-    auto new_bt = torch::zeros({batch_size, max_dst_len}, raw_bt.options());
-    auto new_acc = new_bt.accessor<int32_t, 2>();
-    auto old_acc = raw_bt.accessor<int32_t, 2>();
-
-    for (int32_t s = 0; s < batch_size; ++s) {
-      int32_t pad_len = dst_lens[s] - current_cols;
-      if (pad_len > 0) {
-        for (int32_t j = 0; j < current_cols; ++j)
-          new_acc[s][pad_len + j] = old_acc[s][j];
-      } else if (pad_len < 0) {
-        for (int32_t j = 0; j < dst_lens[s]; ++j) new_acc[s][j] = old_acc[s][j];
-      } else {
-        for (int32_t j = 0; j < current_cols; ++j)
-          new_acc[s][j] = old_acc[s][j];
-      }
-    }
-    out_bt = new_bt;
-  }
-
-  // Build actual_seq_lengths_kv and actual_seq_lengths_query.
-  // Prefill: kv = context_length, query = pad(cumsum(kv), (1,0), 0)
-  // Decode:  kv = context_length, query = pad(cumsum(ones), (1,0), 0)
-  static void build_dsa_seq_lengths(const ModelInputParams& params,
-                                    int32_t batch_size,
-                                    layer::AttentionMetadata& attn_metadata) {
-    auto kv_lens =
-        torch::tensor(std::vector<int32_t>(params.kv_seq_lens_vec.begin(),
-                                           params.kv_seq_lens_vec.end()),
-                      torch::kInt32);
-    attn_metadata.dsa_actual_seq_lengths_kv = kv_lens;
-
-    torch::Tensor q_lens;
-    if (params.is_prefill) {
-      // prefill: query lengths = context lengths
-      q_lens = kv_lens;
-    } else {
-      // decode: each seq has query length = 1
-      q_lens = torch::ones({batch_size}, torch::kInt32);
-    }
-    // cumsum with leading 0: shape (batch_size+1,)
-    auto cumsum = torch::cumsum(q_lens, /*dim=*/0, /*dtype=*/torch::kInt32);
-    attn_metadata.dsa_actual_seq_lengths_query =
-        torch::cat({torch::zeros({1}, torch::kInt32), cumsum});
-  }
-
-  // Build input_positions, c4_pad_positions, c128_pad_positions.
-  // c4_pad_positions: positions where (pos+1) % 4 == 0, adjusted, padded.
-  // c128_pad_positions: positions where (pos+1) % 128 == 0, adjusted, padded.
-  static void build_dsa_positions(const ModelInputParams& params,
-                                  int32_t batch_size,
-                                  int64_t total_tokens,
-                                  layer::AttentionMetadata& attn_metadata) {
-    // input_positions from q_seq_lens_vec (flatten positions)
-    // Already available as model forward `positions` arg, but we also store it
-    // in attn_metadata for DSA operator use.
-    // Note: this will be set from the `positions` tensor passed to forward().
-    // Here we only compute c4/c128 pad positions if input_positions is set.
-    if (!attn_metadata.dsa_input_positions.defined()) return;
-
-    auto input_positions = attn_metadata.dsa_input_positions;
-    int64_t num_tokens = input_positions.size(0);
-
-    // C4 compressed positions
-    auto c4_mask = ((input_positions + 1) % 4).eq(0);
-    auto c4_pos = input_positions.index({c4_mask});
-    c4_pos = (c4_pos + 1) - 4;
-    int64_t c4_target = std::min(num_tokens, num_tokens / 4 + batch_size);
-    int64_t c4_pad_right = c4_target - c4_pos.size(0);
-    if (c4_pad_right > 0) {
-      attn_metadata.dsa_c4_pad_positions =
-          torch::cat({c4_pos, torch::zeros({c4_pad_right}, c4_pos.options())});
-    } else {
-      attn_metadata.dsa_c4_pad_positions = c4_pos.slice(0, 0, c4_target);
-    }
-
-    // C128 compressed positions
-    auto c128_mask = ((input_positions + 1) % 128).eq(0);
-    auto c128_pos = input_positions.index({c128_mask});
-    c128_pos = (c128_pos + 1) - 128;
-    int64_t c128_target = std::min(num_tokens, num_tokens / 128 + batch_size);
-    int64_t c128_pad_right = c128_target - c128_pos.size(0);
-    if (c128_pad_right > 0) {
-      attn_metadata.dsa_c128_pad_positions = torch::cat(
-          {c128_pos, torch::zeros({c128_pad_right}, c128_pos.options())});
-    } else {
-      attn_metadata.dsa_c128_pad_positions = c128_pos.slice(0, 0, c128_target);
-    }
   }
 
   torch::Tensor dsa_cos_sin_;

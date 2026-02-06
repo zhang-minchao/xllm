@@ -1,0 +1,333 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "dsa_metadata_builder.h"
+
+#include <algorithm>
+#include <cmath>
+
+#include "attention_metadata.h"
+#include "attention_metadata_builder.h"
+#include "dsa_metadata.h"
+#include "framework/model/model_input_params.h"
+
+namespace xllm::layer {
+
+AttentionMetadata DSAMetadataBuilder::build(
+    const ModelInputParams& params,
+    const torch::Tensor& positions,
+    const torch::Tensor& dsa_cos_sin,
+    const std::vector<std::vector<DSACacheInfo>>& caches_info,
+    const std::vector<DSAGroupInfo>& group_infos) {
+  // 1. Build base AttentionMetadata (q_cu_seq_lens, block_table, etc.)
+  AttentionMetadata attn_metadata = AttentionMetadataBuilder::build(params);
+
+  // 2. Build DSA-specific fields
+  auto dsa_metadata = std::make_shared<DSAMetadata>();
+  build_dsa_fields(
+      params, positions, dsa_cos_sin, caches_info, group_infos, *dsa_metadata);
+
+  // 3. Attach to AttentionMetadata
+  attn_metadata.dsa_metadata = std::move(dsa_metadata);
+
+  return attn_metadata;
+}
+
+void DSAMetadataBuilder::build_dsa_fields(
+    const ModelInputParams& params,
+    const torch::Tensor& positions,
+    const torch::Tensor& dsa_cos_sin,
+    const std::vector<std::vector<DSACacheInfo>>& caches_info,
+    const std::vector<DSAGroupInfo>& group_infos,
+    DSAMetadata& dsa) {
+  // --- Base attention fields replicated into DSAMetadata ---
+  // seq_lens: kv sequence lengths from params
+  dsa.seq_lens =
+      torch::tensor(std::vector<int32_t>(params.kv_seq_lens_vec.begin(),
+                                         params.kv_seq_lens_vec.end()),
+                    torch::kInt32);
+
+  // --- RoPE cos/sin extraction ---
+  if (dsa_cos_sin.defined() && positions.defined()) {
+    torch::Tensor cos_sin = dsa_cos_sin;
+    if (cos_sin.device() != positions.device()) {
+      cos_sin = cos_sin.to(positions.device());
+    }
+    auto target = cos_sin.index({positions});
+    auto chunks = target.chunk(/*chunks=*/2, /*dim=*/-1);
+    dsa.cos = chunks[0].contiguous();
+    dsa.sin = chunks[1].contiguous();
+  }
+
+  // --- Block tables / slots expansion ---
+  if (!params.multi_block_tables.empty() && !caches_info.empty()) {
+    dsa.input_positions = positions;
+
+    const int32_t manager_num =
+        static_cast<int32_t>(params.multi_block_tables.size());
+    const int32_t n_layers = static_cast<int32_t>(caches_info.size());
+    const int32_t batch_size =
+        static_cast<int32_t>(params.kv_seq_lens_vec.size());
+    const auto& ctx_lens = params.kv_seq_lens_vec;
+    int64_t total_tokens = 0;
+    for (auto len : ctx_lens) total_tokens += len;
+
+    // Step 1: block -> slot expansion per manager
+    std::vector<torch::Tensor> mgr_slots(manager_num);
+    for (int32_t m = 0; m < manager_num; ++m) {
+      mgr_slots[m] = expand_blocks_to_slots(params.multi_block_tables[m],
+                                            group_infos[m],
+                                            ctx_lens,
+                                            batch_size,
+                                            total_tokens);
+    }
+
+    // Step 2: per-group processing
+    std::vector<torch::Tensor> proc_slots(manager_num);
+    std::vector<torch::Tensor> proc_bt(manager_num);
+    for (int32_t m = 0; m < manager_num; ++m) {
+      process_group(params.multi_block_tables[m],
+                    mgr_slots[m],
+                    group_infos[m],
+                    ctx_lens,
+                    batch_size,
+                    total_tokens,
+                    proc_bt[m],
+                    proc_slots[m]);
+    }
+
+    // Step 3: expand by layer using group_id
+    dsa.block_tables.resize(n_layers);
+    dsa.slot_mappings.resize(n_layers);
+    for (int32_t lid = 0; lid < n_layers; ++lid) {
+      const auto& lci = caches_info[lid];
+      dsa.block_tables[lid].resize(lci.size());
+      dsa.slot_mappings[lid].resize(lci.size());
+      for (size_t ci = 0; ci < lci.size(); ++ci) {
+        int32_t gid = lci[ci].group_id;
+        if (gid < manager_num) {
+          dsa.block_tables[lid][ci] = proc_bt[gid];
+          dsa.slot_mappings[lid][ci] = proc_slots[gid];
+        }
+      }
+    }
+
+    // Build actual_seq_lengths_kv and actual_seq_lengths_query
+    build_seq_lengths(params, batch_size, dsa);
+
+    // Build compressed positions (c4/c128)
+    build_positions(params, batch_size, total_tokens, dsa);
+
+    // Attach cache spec pointer
+    dsa.caches_info = &caches_info;
+  }
+}
+
+torch::Tensor DSAMetadataBuilder::expand_blocks_to_slots(
+    const torch::Tensor& block_table,
+    const DSAGroupInfo& gi,
+    const std::vector<int>& ctx_lens,
+    int32_t batch_size,
+    int64_t total_tokens) {
+  const int32_t bs = gi.block_size;
+  auto slots = torch::full({total_tokens}, -1, torch::kInt32);
+  auto slots_acc = slots.accessor<int32_t, 1>();
+  auto bt_acc = block_table.accessor<int32_t, 2>();
+  const int32_t max_blocks = block_table.size(1);
+
+  int64_t start_idx = 0;
+  for (int32_t seq = 0; seq < batch_size; ++seq) {
+    int64_t token_len = ctx_lens[seq];
+    int64_t slot_num = compute_slot_num(gi, token_len);
+
+    int64_t filled = 0;
+    for (int32_t blk = 0; blk < max_blocks && filled < slot_num; ++blk) {
+      int32_t block_id = bt_acc[seq][blk];
+      if (block_id < 0) break;
+      for (int32_t off = 0; off < bs && filled < slot_num; ++off) {
+        slots_acc[start_idx + filled] =
+            static_cast<int32_t>(static_cast<int64_t>(block_id) * bs + off);
+        ++filled;
+      }
+    }
+    start_idx += token_len;
+  }
+  return slots;
+}
+
+int64_t DSAMetadataBuilder::compute_slot_num(const DSAGroupInfo& gi,
+                                             int64_t token_len) {
+  if (gi.type == DSACacheType::TOKEN) {
+    return token_len / gi.ratio;
+  }
+  // SLIDING_WINDOW
+  const int32_t bs = gi.block_size;
+  if (token_len > bs) {
+    return token_len % bs + bs;
+  }
+  int64_t n = token_len % bs;
+  return (n == 0 && token_len > 0) ? bs : n;
+}
+
+void DSAMetadataBuilder::process_group(const torch::Tensor& raw_bt,
+                                       const torch::Tensor& raw_slots,
+                                       const DSAGroupInfo& gi,
+                                       const std::vector<int>& ctx_lens,
+                                       int32_t batch_size,
+                                       int64_t total_tokens,
+                                       torch::Tensor& out_bt,
+                                       torch::Tensor& out_slots) {
+  if (gi.type == DSACacheType::TOKEN) {
+    process_token_group(raw_bt,
+                        raw_slots,
+                        gi.ratio,
+                        batch_size,
+                        total_tokens,
+                        out_bt,
+                        out_slots);
+  } else if (gi.type == DSACacheType::SLIDING_WINDOW) {
+    process_swa_group(raw_bt,
+                      raw_slots,
+                      gi.block_size,
+                      ctx_lens,
+                      batch_size,
+                      out_bt,
+                      out_slots);
+  } else {
+    out_slots =
+        torch::where(raw_slots.eq(-1), torch::zeros_like(raw_slots), raw_slots);
+    out_bt = raw_bt;
+  }
+}
+
+void DSAMetadataBuilder::process_token_group(const torch::Tensor& raw_bt,
+                                             const torch::Tensor& raw_slots,
+                                             int32_t ratio,
+                                             int32_t batch_size,
+                                             int64_t total_tokens,
+                                             torch::Tensor& out_bt,
+                                             torch::Tensor& out_slots) {
+  int64_t op_need_length = std::min(
+      total_tokens / ratio + static_cast<int64_t>(batch_size), total_tokens);
+  auto sort_key = torch::where(raw_slots.eq(-1),
+                               torch::ones_like(raw_slots),
+                               torch::zeros_like(raw_slots));
+  auto sorted_idx =
+      sort_key.argsort(/*dim=*/0, /*descending=*/false, /*stable=*/true);
+  auto slots = raw_slots.index_select(0, sorted_idx)
+                   .slice(/*dim=*/0, /*start=*/0, /*end=*/op_need_length)
+                   .contiguous();
+  out_slots = torch::where(slots.eq(-1), torch::zeros_like(slots), slots);
+  out_bt = raw_bt;  // keep original right-padded block_tables
+}
+
+void DSAMetadataBuilder::process_swa_group(const torch::Tensor& raw_bt,
+                                           const torch::Tensor& raw_slots,
+                                           int32_t block_size,
+                                           const std::vector<int>& ctx_lens,
+                                           int32_t batch_size,
+                                           torch::Tensor& out_bt,
+                                           torch::Tensor& out_slots) {
+  out_slots =
+      torch::where(raw_slots.eq(-1), torch::zeros_like(raw_slots), raw_slots);
+
+  int32_t current_cols = raw_bt.size(1);
+  int32_t max_dst_len = 0;
+  std::vector<int32_t> dst_lens(batch_size);
+  for (int32_t s = 0; s < batch_size; ++s) {
+    dst_lens[s] = static_cast<int32_t>(
+        std::ceil(static_cast<double>(ctx_lens[s]) / block_size));
+    max_dst_len = std::max(max_dst_len, dst_lens[s]);
+  }
+  max_dst_len = std::max(max_dst_len, current_cols);
+
+  auto new_bt = torch::zeros({batch_size, max_dst_len}, raw_bt.options());
+  auto new_acc = new_bt.accessor<int32_t, 2>();
+  auto old_acc = raw_bt.accessor<int32_t, 2>();
+
+  for (int32_t s = 0; s < batch_size; ++s) {
+    int32_t pad_len = dst_lens[s] - current_cols;
+    if (pad_len > 0) {
+      for (int32_t j = 0; j < current_cols; ++j)
+        new_acc[s][pad_len + j] = old_acc[s][j];
+    } else if (pad_len < 0) {
+      for (int32_t j = 0; j < dst_lens[s]; ++j) new_acc[s][j] = old_acc[s][j];
+    } else {
+      for (int32_t j = 0; j < current_cols; ++j) new_acc[s][j] = old_acc[s][j];
+    }
+  }
+  out_bt = new_bt;
+}
+
+void DSAMetadataBuilder::build_seq_lengths(const ModelInputParams& params,
+                                           int32_t batch_size,
+                                           DSAMetadata& dsa_metadata) {
+  auto kv_lens =
+      torch::tensor(std::vector<int32_t>(params.kv_seq_lens_vec.begin(),
+                                         params.kv_seq_lens_vec.end()),
+                    torch::kInt32);
+  dsa_metadata.actual_seq_lengths_kv = kv_lens;
+
+  torch::Tensor q_lens;
+  if (params.is_prefill) {
+    // prefill: query lengths = context lengths
+    q_lens = kv_lens;
+  } else {
+    // decode: each seq has query length = 1
+    q_lens = torch::ones({batch_size}, torch::kInt32);
+  }
+  // cumsum with leading 0: shape (batch_size+1,)
+  auto cumsum = torch::cumsum(q_lens, /*dim=*/0, /*dtype=*/torch::kInt32);
+  dsa_metadata.actual_seq_lengths_query =
+      torch::cat({torch::zeros({1}, torch::kInt32), cumsum});
+}
+
+void DSAMetadataBuilder::build_positions(const ModelInputParams& params,
+                                         int32_t batch_size,
+                                         int64_t total_tokens,
+                                         DSAMetadata& dsa_metadata) {
+  if (!dsa_metadata.input_positions.defined()) return;
+
+  auto input_positions = dsa_metadata.input_positions;
+  int64_t num_tokens = input_positions.size(0);
+
+  // C4 compressed positions
+  auto c4_mask = ((input_positions + 1) % 4).eq(0);
+  auto c4_pos = input_positions.index({c4_mask});
+  c4_pos = (c4_pos + 1) - 4;
+  int64_t c4_target = std::min(num_tokens, num_tokens / 4 + batch_size);
+  int64_t c4_pad_right = c4_target - c4_pos.size(0);
+  if (c4_pad_right > 0) {
+    dsa_metadata.c4_pad_positions =
+        torch::cat({c4_pos, torch::zeros({c4_pad_right}, c4_pos.options())});
+  } else {
+    dsa_metadata.c4_pad_positions = c4_pos.slice(0, 0, c4_target);
+  }
+
+  // C128 compressed positions
+  auto c128_mask = ((input_positions + 1) % 128).eq(0);
+  auto c128_pos = input_positions.index({c128_mask});
+  c128_pos = (c128_pos + 1) - 128;
+  int64_t c128_target = std::min(num_tokens, num_tokens / 128 + batch_size);
+  int64_t c128_pad_right = c128_target - c128_pos.size(0);
+  if (c128_pad_right > 0) {
+    dsa_metadata.c128_pad_positions = torch::cat(
+        {c128_pos, torch::zeros({c128_pad_right}, c128_pos.options())});
+  } else {
+    dsa_metadata.c128_pad_positions = c128_pos.slice(0, 0, c128_target);
+  }
+}
+
+}  // namespace xllm::layer
