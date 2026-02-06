@@ -37,4 +37,25 @@ at::Tensor hc_post(const at::Tensor& x,
                    const at::Tensor& post,
                    const at::Tensor& comb);
 
+std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& weights,
+    const at::Tensor& query_dequant_scale,
+    const at::Tensor& key_dequant_scale,
+    int64_t query_quant_mode,
+    int64_t key_quant_mode,
+    const c10::optional<at::Tensor>& actual_seq_lengths_query,
+    const c10::optional<at::Tensor>& actual_seq_lengths_key,
+    const c10::optional<at::Tensor>& block_table,
+    const c10::optional<at::Tensor>& metadata,
+    c10::string_view layout_query,
+    c10::string_view layout_key,
+    int64_t sparse_count,
+    int64_t sparse_mode,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    int64_t cmp_ratio,
+    bool return_value);
+
 }  // namespace xllm::kernel::npu

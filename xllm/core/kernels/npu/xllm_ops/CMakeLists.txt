@@ -10,6 +10,7 @@ cc_library(
     replace_token.cpp
     top_k_top_p.cpp
     hc_post.cpp
+    quant_lightning_indexer.cpp
     ../utils.cpp
     beam_search.cpp
   DEPS
