@@ -123,4 +123,24 @@ compressor(const at::Tensor& x,
            int64_t rotary_mode,
            bool enable_grad);
 
+at::Tensor quant_lightning_indexer_metadata(
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t head_dim,
+    int64_t query_quant_mode,
+    int64_t key_quant_mode,
+    const c10::optional<at::Tensor>& actual_seq_lengths_query,
+    const c10::optional<at::Tensor>& actual_seq_lengths_key,
+    int64_t batch_size,
+    int64_t max_seqlen_q,
+    int64_t max_seqlen_k,
+    const c10::string_view layout_query,
+    c10::string_view layout_key,
+    int64_t sparse_count,
+    int64_t sparse_mode,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    int64_t cmp_ratio,
+    const c10::string_view device);
+
 }  // namespace xllm::kernel::npu
