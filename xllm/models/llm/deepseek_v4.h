@@ -32,6 +32,28 @@ limitations under the License.
 
 namespace xllm {
 
+inline int64_t deepseek_v4_next_power_of_two(int64_t n) {
+  int64_t value = 1;
+  while (value < n) {
+    value <<= 1;
+  }
+  return value;
+}
+
+inline torch::Tensor deepseek_v4_create_hadamard_matrix(
+    int64_t n,
+    torch::ScalarType dtype,
+    const torch::Device& device) {
+  auto options = torch::TensorOptions().dtype(dtype).device(device);
+  torch::Tensor matrix = torch::ones({1, 1}, options);
+  for (int64_t m = 1; m < n; m <<= 1) {
+    auto top = torch::cat({matrix, matrix}, 1);
+    auto bottom = torch::cat({matrix, -matrix}, 1);
+    matrix = torch::cat({top, bottom}, 0);
+  }
+  return matrix;
+}
+
 // Group key: (ratio, type, block_size) -> group_id
 struct DSAGroupKey {
   int32_t ratio;
@@ -115,6 +137,15 @@ class DeepseekV4ModelImpl
               /*original_max_position_embeddings=*/original_max_pos,
               options);
       dsa_cos_sin_ = dsa_rotary_embedding_->get_cos_sin_cache("default");
+    }
+
+    if (model_args.index_head_dim() > 0) {
+      auto hadamard_dim_padded =
+          deepseek_v4_next_power_of_two(model_args.index_head_dim());
+      dsa_hadamard_ =
+          deepseek_v4_create_hadamard_matrix(hadamard_dim_padded,
+                                             options.dtype().toScalarType(),
+                                             options.device());
     }
 
     for (int32_t i = 0; i < model_args.n_layers(); ++i) {
@@ -232,6 +263,10 @@ class DeepseekV4ModelImpl
     if (attn_metadata.dsa_metadata) {
       auto& dsa = *(attn_metadata.dsa_metadata);
 
+      if (dsa_hadamard_.defined()) {
+        dsa.hadamard = dsa_hadamard_;
+      }
+
       if (dsa_rotary_embedding_) {
         std::unordered_map<std::string, torch::Tensor> positions_map;
 
@@ -343,6 +378,7 @@ class DeepseekV4ModelImpl
   }
 
   torch::Tensor dsa_cos_sin_;
+  torch::Tensor dsa_hadamard_;
   std::shared_ptr<layer::DeepseekV4RotaryEmbedding> dsa_rotary_embedding_;
 
   int64_t hc_mult_ = 1;

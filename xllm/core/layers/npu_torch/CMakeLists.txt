@@ -7,10 +7,14 @@ cc_library(
     attention.h
     deepseek_sparse_attention.h
     compressor.h
+    deepseek_v4_indexer.h
   SRCS
     attention.cpp
     deepseek_sparse_attention.cpp
     compressor.cpp
+    deepseek_v4_indexer.cpp
   DEPS
     :common_layers
 )
+
+add_subdirectory(tests)
