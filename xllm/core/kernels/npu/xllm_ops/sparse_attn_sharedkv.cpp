@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@ limitations under the License.
 
 #include <torch/library.h>
 
+#include <string>
+
 #include "core/kernels/npu/pytorch_npu_helper.h"
 #include "xllm_ops_api.h"
 
@@ -22,16 +24,16 @@ namespace xllm::kernel::npu {
 namespace {
 
 void check_sparse_attn_sharedkv_shape_and_dtype(const at::Tensor& q,
-                                                const char* layout_q,
-                                                const char* layout_kv) {
+                                                c10::string_view layout_q,
+                                                c10::string_view layout_kv) {
   TORCH_CHECK(q.dim() >= 1,
               "Input tensor q's dim num should be at least 1, actual ",
               q.dim(),
               ".");
   TORCH_CHECK(q.dtype() == at::kHalf || q.dtype() == at::kBFloat16,
               "q should be FLOAT16 or BFLOAT16.");
-  TORCH_CHECK(layout_q != nullptr, "layout_q should not be nullptr.");
-  TORCH_CHECK(layout_kv != nullptr, "layout_kv should not be nullptr.");
+  TORCH_CHECK(!layout_q.empty(), "layout_q should not be empty.");
+  TORCH_CHECK(!layout_kv.empty(), "layout_kv should not be empty.");
 }
 
 at::Tensor construct_sparse_attn_sharedkv_attn_out_tensor(const at::Tensor& q) {
@@ -72,16 +74,18 @@ std::tuple<at::Tensor, at::Tensor> sparse_attn_sharedkv(
     int64_t cmp_mask_mode,
     int64_t ori_win_left,
     int64_t ori_win_right,
-    const char* layout_q,
-    const char* layout_kv,
+    c10::string_view layout_q,
+    c10::string_view layout_kv,
     bool return_softmax_lse) {
   check_sparse_attn_sharedkv_shape_and_dtype(q, layout_q, layout_kv);
   at::Tensor attn_out = construct_sparse_attn_sharedkv_attn_out_tensor(q);
   at::Tensor softmax_lse =
       construct_sparse_attn_sharedkv_softmax_lse_tensor(q, return_softmax_lse);
 
-  auto layout_q_arg = const_cast<char*>(layout_q);
-  auto layout_kv_arg = const_cast<char*>(layout_kv);
+  std::string layout_q_str = std::string(layout_q);
+  std::string layout_kv_str = std::string(layout_kv);
+  auto layout_q_arg = const_cast<char*>(layout_q_str.c_str());
+  auto layout_kv_arg = const_cast<char*>(layout_kv_str.c_str());
 
   EXEC_NPU_CMD(aclnnSparseAttnSharedkv,
                q,

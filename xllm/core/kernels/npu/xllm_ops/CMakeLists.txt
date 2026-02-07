@@ -17,6 +17,8 @@ cc_library(
     sparse_attn_sharedkv_metadata.cpp
     moe_gating_top_k_hash.cpp
     sparse_attn_sharedkv.cpp
+    sparse_flash_attention.cpp
+    mla_preprocess.cpp
     ../utils.cpp
     beam_search.cpp
   DEPS
