@@ -32,9 +32,17 @@ class CompressorImpl : public torch::nn::Module {
   CompressorImpl(int64_t compress_ratio, int64_t head_dim);
   CompressorImpl(int64_t compress_ratio,
                  int64_t head_dim,
+                 const torch::TensorOptions& options =
+                     torch::TensorOptions().dtype(torch::kFloat32).device(
+                         torch::kCPU));
+  CompressorImpl(int64_t compress_ratio,
+                 int64_t head_dim,
                  int64_t rope_head_dim,
                  int64_t rot_mode,
-                 double norm_eps);
+                 double norm_eps,
+                 const torch::TensorOptions& options =
+                     torch::TensorOptions().dtype(torch::kFloat32).device(
+                         torch::kCPU));
 
   torch::Tensor forward(const DSAMetadata& attn_metadata,
                         torch::Tensor& hidden_states,
@@ -56,8 +64,8 @@ class CompressorImpl : public torch::nn::Module {
   int64_t compress_ratio_;
   int64_t rot_mode_;
   double eps_;
+  torch::TensorOptions options_;
   bool enable_compressor_overlap_ = false;
-  bool weight_is_loaded_ = false;
 };
 TORCH_MODULE(Compressor);
 

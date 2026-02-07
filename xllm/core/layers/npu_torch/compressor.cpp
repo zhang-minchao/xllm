@@ -16,9 +16,15 @@ limitations under the License.
 #include "compressor.h"
 
 #include <glog/logging.h>
-#include <torch_npu/csrc/core/npu/NPUFormat.h>
-
 #include <tuple>
+
+#if defined(USE_NPU)
+#ifdef TORCH_HIGHER_THAN_PTA6
+#include <torch_npu/csrc/core/npu/NPUFormat.h>
+#else
+#include <torch_npu/csrc/aten/NPUNativeFunctions.h>
+#endif
+#endif
 
 #include "kernels/ops_api.h"
 #include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
@@ -28,18 +34,31 @@ namespace xllm {
 namespace layer {
 
 CompressorImpl::CompressorImpl(int64_t compress_ratio, int64_t head_dim)
-    : CompressorImpl(compress_ratio, head_dim, 64, 2, 1e-6) {}
+    : CompressorImpl(compress_ratio,
+                     head_dim,
+                     64,
+                     2,
+                     1e-6,
+                     torch::TensorOptions().dtype(torch::kFloat32).device(
+                         torch::kCPU)) {}
+
+CompressorImpl::CompressorImpl(int64_t compress_ratio,
+                               int64_t head_dim,
+                               const torch::TensorOptions& options)
+    : CompressorImpl(compress_ratio, head_dim, 64, 2, 1e-6, options) {}
 
 CompressorImpl::CompressorImpl(int64_t compress_ratio,
                                int64_t head_dim,
                                int64_t rope_head_dim,
                                int64_t rot_mode,
-                               double norm_eps)
+                               double norm_eps,
+                               const torch::TensorOptions& options)
     : compress_ratio_(compress_ratio),
       head_dim_(head_dim),
       rope_head_dim_(rope_head_dim),
       rot_mode_(rot_mode),
-      eps_(norm_eps) {
+      eps_(norm_eps),
+      options_(options) {
   enable_compressor_overlap_ = (compress_ratio == 4);
 }
 
@@ -84,23 +103,55 @@ torch::Tensor CompressorImpl::forward(
   return compressed_kv;
 }
 
-// TODO:trans weight to_device
 void CompressorImpl::load_state_dict(const StateDict& state_dict) {
-  // state_dict.get_tensor(tensor_name).to(device_)
-  xllm::weight::load_weight(
-      state_dict, "wkv.weight", cmp_wkv_, weight_is_loaded_);
-  xllm::weight::load_weight(
-      state_dict, "wgate.weight", cmp_wgate_, weight_is_loaded_);
-  cmp_wkv_ = at_npu::native::npu_format_cast(cmp_wkv_, 29);
-  cmp_wgate_ = at_npu::native::npu_format_cast(cmp_wgate_, 29);
-  xllm::weight::load_weight(
-      state_dict, "norm.weight", cmp_norm_, weight_is_loaded_);
+  const auto wkv = state_dict.get_tensor("wkv.weight");
+  const auto wgate = state_dict.get_tensor("wgate.weight");
+  const auto norm = state_dict.get_tensor("norm.weight");
+
+  CHECK(wkv.defined()) << "missing weight: " << state_dict.prefix()
+                       << "wkv.weight";
+  CHECK(wgate.defined()) << "missing weight: " << state_dict.prefix()
+                         << "wgate.weight";
+  CHECK(norm.defined()) << "missing weight: " << state_dict.prefix()
+                        << "norm.weight";
+
+  cmp_wkv_ = wkv.to(options_);
+  cmp_wgate_ = wgate.to(options_);
+  cmp_norm_ = norm.to(options_);
+
+  CHECK(cmp_wkv_.defined()) << "cmp_wkv is undefined before format cast";
+  CHECK(cmp_wgate_.defined()) << "cmp_wgate is undefined before format cast";
+  const bool is_npu_device =
+      options_.device().type() == c10::DeviceType::PrivateUse1;
+
+#if defined(USE_NPU)
+  if (is_npu_device) {
+    cmp_wkv_ = at_npu::native::npu_format_cast(cmp_wkv_, 29);
+    cmp_wgate_ = at_npu::native::npu_format_cast(cmp_wgate_, 29);
+  }
+#else
+  CHECK(!is_npu_device)
+      << "Compressor weights are on NPU device, but xllm is built without "
+         "USE_NPU.";
+#endif
+
+  CHECK_EQ(cmp_wkv_.device(), options_.device())
+      << "cmp_wkv device mismatch, expected: " << options_.device()
+      << ", actual: " << cmp_wkv_.device();
+  CHECK_EQ(cmp_wgate_.device(), options_.device())
+      << "cmp_wgate device mismatch, expected: " << options_.device()
+      << ", actual: " << cmp_wgate_.device();
+  CHECK_EQ(cmp_norm_.device(), options_.device())
+      << "cmp_norm device mismatch, expected: " << options_.device()
+      << ", actual: " << cmp_norm_.device();
 
   auto coff = enable_compressor_overlap_ ? 2 : 1;
   cmp_ape_ = torch::empty(
       {compress_ratio_, coff * head_dim_},
-      torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
-  // TODO - check if ape in cpu or npu
+      options_.dtype(torch::kFloat32));
+  CHECK_EQ(cmp_ape_.device(), options_.device())
+      << "cmp_ape device mismatch, expected: " << options_.device()
+      << ", actual: " << cmp_ape_.device();
 }
 
 }  // namespace layer

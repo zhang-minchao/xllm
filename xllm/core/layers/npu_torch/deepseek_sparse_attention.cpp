@@ -96,7 +96,8 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
     compressor_ =
         register_module("compressor",
                         Compressor(static_cast<int64_t>(compress_ratio_),
-                                   head_dim_));  // TODO - ADD Indexer
+                                   head_dim_,
+                                   options));  // TODO - ADD Indexer
     if (compress_ratio_ == 4) {
       //     self.indexer = Indexer(config, f"{prefix}.indexer",
       //     self.compress_ratio)
