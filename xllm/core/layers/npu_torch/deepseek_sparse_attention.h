@@ -1,0 +1,109 @@
+/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#pragma once
+
+#include <torch/torch.h>
+
+#include <string>
+#include <tuple>
+
+#include "compressor.h"
+#include "framework/kv_cache/kv_cache.h"
+#include "framework/model/model_args.h"
+#include "framework/model/model_input_params.h"
+#include "framework/parallel_state/parallel_args.h"
+#include "framework/quant_args.h"
+#include "framework/state_dict/state_dict.h"
+#include "layers/common/attention_metadata.h"
+#include "layers/common/indexer.h"
+#include "layers/common/linear.h"
+#include "layers/common/rms_norm.h"
+#include "layers/common/rotary_embedding.h"
+
+namespace xllm {
+namespace layer {
+
+// DSA 中 compressor 的 kv/score 状态，与 Python 侧 (ori_kv,
+// compressor_kv_state, compressor_score_state) 对应
+using KVState = std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>;
+
+class DSAttentionImpl : public torch::nn::Module {
+ public:
+  DSAttentionImpl() = default;
+  DSAttentionImpl(const ModelContext& context);
+  DSAttentionImpl(const ModelArgs& args,
+                  const QuantArgs& quant_args,
+                  const ParallelArgs& parallel_args,
+                  const torch::TensorOptions& options);
+
+  std::tuple<torch::Tensor, std::optional<torch::Tensor>> forward(
+      const DSAMetadata& attn_metadata,
+      torch::Tensor& hidden_states,
+      KVCache& kv_cache,
+      KVState& kv_state,
+      bool is_prefill,
+      std::string layer_name,
+      const std::
+          tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>&
+              compress_metadata);
+
+  void load_state_dict(const StateDict& state_dict);
+
+ private:
+  int64_t num_heads_;
+  int64_t head_size_;
+  float scale_;
+  int64_t n_kv_heads_;
+  int64_t sliding_window_;
+  int64_t head_dim_;
+
+  int64_t n_local_heads_;
+  int64_t q_lora_rank_;
+  int64_t o_lora_rank_;
+  int64_t o_groups_;
+
+  int64_t rope_head_dim_;
+  int64_t nope_head_dim_;
+  int64_t window_size_;
+  double compress_ratio_;
+
+  double softmax_scale_;
+  double eps_ = 1e-6;
+  int64_t qk_head_dim_;
+  int64_t n_local_groups_;
+
+  double rope_theta_ = 10000.0;
+  double compress_rope_theta_ = 40000.0;
+
+  ReplicatedLinear q_a_proj_{nullptr};
+  ColumnParallelLinear q_b_proj_{nullptr};
+  RMSNorm q_layernorm_{nullptr};
+
+  ReplicatedLinear kv_proj_{nullptr};
+  RMSNorm kv_layernorm_{nullptr};
+
+  ColumnParallelLinear o_a_proj_{nullptr};
+  RowParallelLinear o_b_proj_{nullptr};
+
+  Attention attn_{nullptr};
+  DeepseekScalingRotaryEmbedding rotary_emb_{nullptr};
+  Indexer indexer_{nullptr};
+  Compressor compressor_{nullptr};
+};
+TORCH_MODULE(DSAttention);
+
+}  // namespace layer
+}  // namespace xllm
