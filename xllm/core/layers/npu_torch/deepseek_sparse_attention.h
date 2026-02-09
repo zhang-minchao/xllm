@@ -20,15 +20,15 @@ limitations under the License.
 #include <string>
 #include <tuple>
 
+#include "attention.h"
 #include "compressor.h"
+#include "deepseek_v4_indexer.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_args.h"
-#include "framework/model/model_input_params.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/quant_args.h"
 #include "framework/state_dict/state_dict.h"
 #include "layers/common/attention_metadata.h"
-#include "layers/common/indexer.h"
 #include "layers/common/linear.h"
 #include "layers/common/rms_norm.h"
 #include "layers/common/rotary_embedding.h"
@@ -36,9 +36,14 @@ limitations under the License.
 namespace xllm {
 namespace layer {
 
-// DSA 中 compressor 的 kv/score 状态，与 Python 侧 (ori_kv,
-// compressor_kv_state, compressor_score_state) 对应
-using KVState = std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>;
+// DSA kv state aligned with Python:
+// (ori_kv, compressor_kv_state, compressor_score_state,
+//  c4_indexer_kv_state, c4_indexer_score_state)
+using KVState = std::tuple<torch::Tensor,
+                           torch::Tensor,
+                           torch::Tensor,
+                           torch::Tensor,
+                           torch::Tensor>;
 
 class DSAttentionImpl : public torch::nn::Module {
  public:
@@ -84,6 +89,9 @@ class DSAttentionImpl : public torch::nn::Module {
   double eps_ = 1e-6;
   int64_t qk_head_dim_;
   int64_t n_local_groups_;
+  int64_t index_n_heads_ = 0;
+  int64_t index_head_dim_ = 0;
+  int64_t index_topk_ = 0;
 
   double rope_theta_ = 10000.0;
   double compress_rope_theta_ = 40000.0;
@@ -100,7 +108,7 @@ class DSAttentionImpl : public torch::nn::Module {
 
   Attention attn_{nullptr};
   DeepseekScalingRotaryEmbedding rotary_emb_{nullptr};
-  Indexer indexer_{nullptr};
+  DeepseekV4Indexer indexer_{nullptr};
   Compressor compressor_{nullptr};
 };
 TORCH_MODULE(DSAttention);

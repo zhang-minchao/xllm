@@ -106,6 +106,13 @@ struct DSAMetadata {
   // c128_pad_positions: positions for C128 compressed RoPE
   torch::Tensor c128_pad_positions;
 
+  // Precomputed sparse/indexer metadata tensors (Python forward aligned).
+  // Built once per model forward before layer iteration.
+  torch::Tensor c1_metadata;
+  torch::Tensor c4_metadata;
+  torch::Tensor c128_metadata;
+  torch::Tensor qli_metadata;
+
   // hadamard: Hadamard transform matrix
   torch::Tensor hadamard;
 

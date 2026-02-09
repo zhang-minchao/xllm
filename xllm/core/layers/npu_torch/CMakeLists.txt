@@ -15,6 +15,7 @@ cc_library(
     deepseek_v4_indexer.cpp
   DEPS
     :common_layers
+    :xllm_ops
 )
 
 add_subdirectory(tests)

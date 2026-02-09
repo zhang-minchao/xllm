@@ -15,8 +15,6 @@ limitations under the License.
 
 #include "deepseek_v4_decoder_layer.h"
 
-#include <torch/nn/functional.h>
-
 #include <algorithm>
 
 namespace xllm {
@@ -46,7 +44,7 @@ DeepseekV4DecoderLayerImpl::DeepseekV4DecoderLayerImpl(
   hc_eps_ = static_cast<double>(args.hc_eps());
   norm_eps_ = static_cast<double>(args.rms_norm_eps());
 
-  attention_ = register_module("attn", Qwen2Attention(context));
+  attention_ = register_module("attn", DSAttention(context));
   attn_norm_ = register_module(
       "attn_norm", RMSNorm(hidden_size, args.rms_norm_eps(), options));
   ffn_norm_ = register_module(
@@ -136,16 +134,37 @@ torch::Tensor DeepseekV4DecoderLayerImpl::forward(
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
     const ModelInputParams& input_params) {
+  (void)positions;
   (void)input_params;
 
   residual = std::nullopt;
+
+  CHECK(attn_metadata.dsa_metadata)
+      << "DeepseekV4DecoderLayer requires DSA metadata for DSAttention path.";
 
   auto residual_attn = x;
   auto [attn_input, post_attn, comb_attn] =
       hc_pre(x, hc_attn_fn_, hc_attn_scale_, hc_attn_base_);
   attn_input = std::get<0>(attn_norm_->forward(attn_input));
-  attn_input =
-      attention_->forward(positions, attn_input, attn_metadata, kv_cache);
+
+  auto& dsa = *(attn_metadata.dsa_metadata);
+  const auto compress_metadata = std::make_tuple(
+      dsa.c1_metadata, dsa.c4_metadata, dsa.c128_metadata, dsa.qli_metadata);
+  KVState kv_state{kv_cache.get_swa_cache(),
+                   kv_cache.get_compress_kv_state(),
+                   kv_cache.get_compress_score_state(),
+                   kv_cache.get_compress_index_kv_state(),
+                   kv_cache.get_compress_index_score_state()};
+  auto [attn_output, attn_lse] = attention_->forward(
+      dsa,
+      attn_input,
+      kv_cache,
+      kv_state,
+      attn_metadata.is_prefill || attn_metadata.is_chunked_prefill,
+      std::to_string(dsa.layer_id),
+      compress_metadata);
+  (void)attn_lse;
+  attn_input = attn_output;
   x = hc_post(attn_input, residual_attn, post_attn, comb_attn);
 
   auto residual_ffn = x;

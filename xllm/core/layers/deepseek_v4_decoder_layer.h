@@ -22,13 +22,13 @@ limitations under the License.
 
 #include "common/attention_metadata.h"
 #include "common/dense_mlp.h"
-#include "common/qwen2_attention.h"
 #include "common/rms_norm.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/model_context.h"
 #include "framework/state_dict/state_dict.h"
 #include "framework/state_dict/utils.h"
+#include "npu_torch/deepseek_sparse_attention.h"
 
 namespace xllm {
 namespace layer {
@@ -58,7 +58,7 @@ class DeepseekV4DecoderLayerImpl : public torch::nn::Module {
                         const torch::Tensor& post,
                         const torch::Tensor& comb);
 
-  Qwen2Attention attention_{nullptr};
+  DSAttention attention_{nullptr};
   DenseMLP mlp_{nullptr};
   RMSNorm attn_norm_{nullptr};
   RMSNorm ffn_norm_{nullptr};

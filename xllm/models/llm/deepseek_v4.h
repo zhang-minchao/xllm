@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <tuple>
 #include <unordered_map>
@@ -29,6 +30,7 @@ limitations under the License.
 #include "core/layers/deepseek_v4_decoder_layer.h"
 #include "layers/npu/deepseek_v4_rotary_embedding.h"
 #include "llm_model_base.h"
+#include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 namespace xllm {
 
@@ -91,6 +93,14 @@ class DeepseekV4ModelImpl
     hc_mult_ = std::max<int64_t>(model_args.hc_mult(), 1);
     hc_eps_ = static_cast<double>(model_args.hc_eps());
     norm_eps_ = static_cast<double>(model_args.rms_norm_eps());
+
+    num_heads_ = model_args.n_heads();
+    head_dim_ = model_args.head_dim();
+    window_size_ =
+        model_args.window_size() > 0 ? model_args.window_size() : 128;
+    index_n_heads_ = model_args.index_n_heads();
+    index_head_dim_ = model_args.index_head_dim();
+    index_topk_ = model_args.index_topk() > 0 ? model_args.index_topk() : 512;
 
     const int64_t hc_dim = hc_mult_ * model_args.hidden_size();
     auto hc_options = options.dtype(torch::kFloat32);
@@ -314,6 +324,8 @@ class DeepseekV4ModelImpl
         dsa.start_pos =
             (dsa.actual_seq_lengths_kv - dsa.seq_lens_q).to(torch::kInt32);
       }
+
+      build_precomputed_metadata(dsa);
     }
 
     std::optional<torch::Tensor> residual;
@@ -366,6 +378,164 @@ class DeepseekV4ModelImpl
   }
 
  private:
+  static c10::optional<torch::Tensor> as_optional_tensor(
+      const torch::Tensor& tensor) {
+    if (tensor.defined() && tensor.numel() > 0) {
+      return c10::optional<torch::Tensor>(tensor);
+    }
+    return c10::nullopt;
+  }
+
+  static int64_t tensor_max_or_zero(const torch::Tensor& tensor) {
+    if (!tensor.defined() || tensor.numel() == 0) {
+      return 0;
+    }
+    return tensor.max().item<int64_t>();
+  }
+
+  static int64_t pick_max_seqlen(const torch::Tensor& max_seqlen_tensor,
+                                 const torch::Tensor& fallback_tensor) {
+    if (max_seqlen_tensor.defined() && max_seqlen_tensor.numel() > 0) {
+      return max_seqlen_tensor.max().item<int64_t>();
+    }
+    return tensor_max_or_zero(fallback_tensor);
+  }
+
+  void build_precomputed_metadata(layer::DSAMetadata& dsa) const {
+    dsa.c1_metadata = torch::Tensor();
+    dsa.c4_metadata = torch::Tensor();
+    dsa.c128_metadata = torch::Tensor();
+    dsa.qli_metadata = torch::Tensor();
+
+    if (!dsa.actual_seq_lengths_query.defined() ||
+        !dsa.actual_seq_lengths_kv.defined()) {
+      return;
+    }
+
+    const int64_t batch_size =
+        std::max<int64_t>(dsa.actual_seq_lengths_kv.size(0), 1);
+    const int64_t max_seqlen_q =
+        pick_max_seqlen(dsa.max_seqlen_q, dsa.seq_lens_q);
+    const int64_t max_seqlen_kv =
+        pick_max_seqlen(dsa.max_seqlen_kv, dsa.actual_seq_lengths_kv);
+    const int64_t ori_win_left = std::max<int64_t>(window_size_ - 1, 0);
+    const int64_t sparse_topk = std::max<int64_t>(index_topk_, 1);
+
+    dsa.c1_metadata = xllm::kernel::npu::sparse_attn_sharedkv_metadata(
+        /*num_heads_q=*/num_heads_,
+        /*num_heads_kv=*/1,
+        /*head_dim=*/head_dim_,
+        as_optional_tensor(dsa.actual_seq_lengths_query),
+        as_optional_tensor(dsa.actual_seq_lengths_kv),
+        /*batch_size=*/batch_size,
+        /*max_seqlen_q=*/max_seqlen_q,
+        /*max_seqlen_kv=*/max_seqlen_kv,
+        /*topk=*/0,
+        /*cmp_ratio=*/1,
+        /*ori_mask_mode=*/4,
+        /*cmp_mask_mode=*/3,
+        /*ori_win_left=*/ori_win_left,
+        /*ori_win_right=*/0,
+        /*layout_q=*/"TND",
+        /*layout_kv=*/"PA_ND",
+        /*has_ori_kv=*/true,
+        /*has_cmp_kv=*/false);
+
+    dsa.c4_metadata = xllm::kernel::npu::sparse_attn_sharedkv_metadata(
+        /*num_heads_q=*/num_heads_,
+        /*num_heads_kv=*/1,
+        /*head_dim=*/head_dim_,
+        as_optional_tensor(dsa.actual_seq_lengths_query),
+        as_optional_tensor(dsa.actual_seq_lengths_kv),
+        /*batch_size=*/batch_size,
+        /*max_seqlen_q=*/max_seqlen_q,
+        /*max_seqlen_kv=*/max_seqlen_kv,
+        /*topk=*/sparse_topk,
+        /*cmp_ratio=*/4,
+        /*ori_mask_mode=*/4,
+        /*cmp_mask_mode=*/3,
+        /*ori_win_left=*/ori_win_left,
+        /*ori_win_right=*/0,
+        /*layout_q=*/"TND",
+        /*layout_kv=*/"PA_ND",
+        /*has_ori_kv=*/true,
+        /*has_cmp_kv=*/true);
+
+    dsa.c128_metadata = xllm::kernel::npu::sparse_attn_sharedkv_metadata(
+        /*num_heads_q=*/num_heads_,
+        /*num_heads_kv=*/1,
+        /*head_dim=*/head_dim_,
+        as_optional_tensor(dsa.actual_seq_lengths_query),
+        as_optional_tensor(dsa.actual_seq_lengths_kv),
+        /*batch_size=*/batch_size,
+        /*max_seqlen_q=*/max_seqlen_q,
+        /*max_seqlen_kv=*/max_seqlen_kv,
+        /*topk=*/0,
+        /*cmp_ratio=*/128,
+        /*ori_mask_mode=*/4,
+        /*cmp_mask_mode=*/3,
+        /*ori_win_left=*/ori_win_left,
+        /*ori_win_right=*/0,
+        /*layout_q=*/"TND",
+        /*layout_kv=*/"PA_ND",
+        /*has_ori_kv=*/true,
+        /*has_cmp_kv=*/true);
+
+    torch::Tensor query_lens;
+    if (dsa.actual_seq_lengths_query.defined() &&
+        dsa.actual_seq_lengths_query.dim() > 0 &&
+        dsa.actual_seq_lengths_query.size(0) > 1) {
+      query_lens = dsa.actual_seq_lengths_query.slice(
+          /*dim=*/0,
+          /*start=*/1,
+          /*end=*/dsa.actual_seq_lengths_query.size(0));
+    } else if (dsa.seq_lens_q.defined()) {
+      query_lens = dsa.seq_lens_q;
+    }
+
+    torch::Tensor key_lens;
+    if (dsa.seq_lens.defined()) {
+      key_lens = dsa.seq_lens;
+    } else if (dsa.actual_seq_lengths_kv.defined()) {
+      key_lens = dsa.actual_seq_lengths_kv;
+    }
+
+    if (!query_lens.defined() || !key_lens.defined() ||
+        query_lens.numel() == 0 || key_lens.numel() == 0) {
+      return;
+    }
+
+    const int64_t index_num_heads =
+        std::max<int64_t>(index_n_heads_ > 0 ? index_n_heads_ : num_heads_, 1);
+    const int64_t index_head_dim =
+        std::max<int64_t>(index_head_dim_ > 0 ? index_head_dim_ : head_dim_, 1);
+    const int64_t qli_batch_size = std::max<int64_t>(key_lens.size(0), 1);
+    const int64_t qli_max_seqlen_q =
+        pick_max_seqlen(dsa.max_seqlen_q, query_lens);
+    const int64_t qli_max_seqlen_k =
+        pick_max_seqlen(dsa.max_seqlen_kv, key_lens);
+
+    dsa.qli_metadata = xllm::kernel::npu::quant_lightning_indexer_metadata(
+        /*num_heads_q=*/index_num_heads,
+        /*num_heads_k=*/1,
+        /*head_dim=*/index_head_dim,
+        /*query_quant_mode=*/0,
+        /*key_quant_mode=*/0,
+        as_optional_tensor(query_lens),
+        as_optional_tensor(key_lens),
+        /*batch_size=*/qli_batch_size,
+        /*max_seqlen_q=*/qli_max_seqlen_q,
+        /*max_seqlen_k=*/qli_max_seqlen_k,
+        /*layout_query=*/"TND",
+        /*layout_key=*/"PA_BSND",
+        /*sparse_count=*/sparse_topk,
+        /*sparse_mode=*/3,
+        /*pre_tokens=*/std::numeric_limits<int64_t>::max(),
+        /*next_tokens=*/std::numeric_limits<int64_t>::max(),
+        /*cmp_ratio=*/4,
+        /*device=*/query_lens.device().str());
+  }
+
   torch::Tensor hc_head(const torch::Tensor& x) {
     auto x_float = x.to(torch::kFloat32);
     auto x_flatten = x_float.flatten(-2, -1);
@@ -384,6 +554,13 @@ class DeepseekV4ModelImpl
   int64_t hc_mult_ = 1;
   double hc_eps_ = 0.0;
   double norm_eps_ = 1e-6;
+
+  int64_t num_heads_ = 0;
+  int64_t head_dim_ = 0;
+  int64_t window_size_ = 128;
+  int64_t index_n_heads_ = 0;
+  int64_t index_head_dim_ = 0;
+  int64_t index_topk_ = 512;
 
   // DSA cache group info: built once at model init from compress_ratios
   // caches_info_[layer_id] = vector of DSACacheInfo for each cache in that
