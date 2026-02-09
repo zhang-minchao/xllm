@@ -61,6 +61,16 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
     bool return_value);
 at::Tensor hc_pre_inv_rms(const at::Tensor& x, double epsilon);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_sinkhorn(
+    const at::Tensor& mixes,
+    const at::Tensor& rsqrt,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    const at::Tensor& x,
+    int64_t hc_mult,
+    int64_t hc_sinkhorn_iters,
+    double hc_eps);
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
     const at::Tensor& x,
     const c10::optional<at::Tensor>& bias,

@@ -771,6 +771,22 @@ torch::Tensor hc_pre_inv_rms(HcPreInvRmsParams& params) {
 #endif
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre_sinkhorn(
+    HcPreSinkhornParams& params) {
+#if defined(USE_NPU)
+  return npu::hc_pre_sinkhorn(params.mixes,
+                              params.rsqrt,
+                              params.hc_scale,
+                              params.hc_base,
+                              params.x,
+                              params.hc_mult,
+                              params.hc_sinkhorn_iters,
+                              params.hc_eps);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> moe_gating_top_k_hash(
     MoeGatingTopKHashParams& params) {
 #if defined(USE_NPU)

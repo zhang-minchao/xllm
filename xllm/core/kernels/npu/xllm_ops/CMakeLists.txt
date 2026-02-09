@@ -13,6 +13,7 @@ cc_library(
     hc_post.cpp
     quant_lightning_indexer.cpp
     hc_pre_inv_rms.cpp
+    hc_pre_sinkhorn.cpp
     quant_lightning_indexer_metadata.cpp
     sparse_attn_sharedkv_metadata.cpp
     moe_gating_top_k_hash.cpp
