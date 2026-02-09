@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <algorithm>
 
+#include "kernels/ops_api.h"
+
 namespace xllm {
 namespace layer {
 
@@ -182,60 +184,37 @@ DeepseekV4DecoderLayerImpl::hc_pre(const torch::Tensor& x,
                                    const torch::Tensor& hc_fn,
                                    const torch::Tensor& hc_scale,
                                    const torch::Tensor& hc_base) {
-  auto x_float = x.to(torch::kFloat32);
-  auto x_flatten = x_float.flatten(-2, -1);
-  auto rsqrt = torch::rsqrt(x_flatten.pow(2).mean(-1, true) + norm_eps_);
-
-  auto mixes = torch::matmul(x_flatten, hc_fn.transpose(0, 1));
-  mixes = mixes * rsqrt;
-
-  const int64_t hc_mult = hc_mult_;
-  const int64_t mix_hc = (2 + hc_mult) * hc_mult;
-
-  auto mixes_pre = mixes.slice(-1, 0, hc_mult);
-  auto mixes_post = mixes.slice(-1, hc_mult, 2 * hc_mult);
-  auto mixes_comb = mixes.slice(-1, 2 * hc_mult, mix_hc);
-
-  auto hc_scale_pre = hc_scale.index({0});
-  auto hc_scale_post = hc_scale.index({1});
-  auto hc_scale_comb = hc_scale.index({2});
-
-  auto hc_base_pre = hc_base.slice(0, 0, hc_mult);
-  auto hc_base_post = hc_base.slice(0, hc_mult, 2 * hc_mult);
-  auto hc_base_comb = hc_base.slice(0, 2 * hc_mult, mix_hc);
-
-  auto pre = torch::sigmoid(mixes_pre * hc_scale_pre + hc_base_pre) + hc_eps_;
-  auto post = torch::sigmoid(mixes_post * hc_scale_post + hc_base_post) * 2.0f;
-
-  auto comb_shape = mixes_comb.sizes().vec();
-  comb_shape.back() = hc_mult;
-  comb_shape.push_back(hc_mult);
-  auto comb = (mixes_comb * hc_scale_comb + hc_base_comb).reshape(comb_shape);
-  comb = torch::softmax(comb, -1) + hc_eps_;
-  for (int64_t iter = 0; iter < hc_sinkhorn_iters_; ++iter) {
-    comb = comb / (comb.sum(-1, true) + hc_eps_);
-    comb = comb / (comb.sum(-2, true) + hc_eps_);
-  }
-
-  auto y = (pre.unsqueeze(-1) * x_float).sum(-2);
-  y = y.to(x.dtype());
-  return {y, post, comb};
+  kernel::HcPreParams params;
+  params.x = x;
+  params.hc_fn = hc_fn;
+  params.hc_scale = hc_scale;
+  params.hc_base = hc_base;
+  params.hc_mult = hc_mult_;
+  params.hc_sinkhorn_iters = hc_sinkhorn_iters_;
+  params.norm_eps = norm_eps_;
+  params.hc_eps = hc_eps_;
+  return kernel::hc_pre(params);
 }
 
 torch::Tensor DeepseekV4DecoderLayerImpl::hc_post(const torch::Tensor& x,
                                                   const torch::Tensor& residual,
                                                   const torch::Tensor& post,
                                                   const torch::Tensor& comb) {
-  auto x_float = x.to(torch::kFloat32);
-  auto residual_float = residual.to(torch::kFloat32);
-  auto post_float = post.to(torch::kFloat32);
-  auto comb_float = comb.to(torch::kFloat32);
+  kernel::HcPostParams params;
+  if (x.dim() == 2 && residual.dim() == 3 && post.dim() == 2 &&
+      comb.dim() == 3) {
+    params.x = x.unsqueeze(0);
+    params.residual = residual.unsqueeze(0);
+    params.post = post.unsqueeze(0);
+    params.comb = comb.unsqueeze(0);
+    return kernel::hc_post(params).squeeze(0);
+  }
 
-  auto residual_mix =
-      torch::matmul(comb_float.transpose(-1, -2), residual_float);
-  auto x_scaled = x_float.unsqueeze(-2) * post_float.unsqueeze(-1);
-  auto y = residual_mix + x_scaled;
-  return y.to(residual.dtype());
+  params.x = x;
+  params.residual = residual;
+  params.post = post;
+  params.comb = comb;
+  return kernel::hc_post(params);
 }
 
 }  // namespace layer

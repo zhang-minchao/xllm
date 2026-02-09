@@ -100,6 +100,9 @@ torch::Tensor hc_pre_inv_rms(HcPreInvRmsParams& params);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre_sinkhorn(
     HcPreSinkhornParams& params);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre(
+    HcPreParams& params);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> moe_gating_top_k_hash(
     MoeGatingTopKHashParams& params);
 

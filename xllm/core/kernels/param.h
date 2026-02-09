@@ -1270,6 +1270,17 @@ struct HcPreSinkhornParams {
   double hc_eps = 1e-6;
 };
 
+struct HcPreParams {
+  torch::Tensor x;
+  torch::Tensor hc_fn;
+  torch::Tensor hc_scale;
+  torch::Tensor hc_base;
+  int64_t hc_mult = 4;
+  int64_t hc_sinkhorn_iters = 20;
+  double norm_eps = 1e-6;
+  double hc_eps = 1e-6;
+};
+
 struct MoeGatingTopKHashParams {
   torch::Tensor x;
   c10::optional<torch::Tensor> bias;

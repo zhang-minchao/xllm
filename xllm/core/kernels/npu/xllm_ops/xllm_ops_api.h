@@ -71,6 +71,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_sinkhorn(
     int64_t hc_sinkhorn_iters,
     double hc_eps);
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre(
+    const at::Tensor& x,
+    const at::Tensor& hc_fn,
+    const at::Tensor& hc_scale,
+    const at::Tensor& hc_base,
+    int64_t hc_mult,
+    int64_t hc_sinkhorn_iters,
+    double norm_eps,
+    double hc_eps);
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash(
     const at::Tensor& x,
     const c10::optional<at::Tensor>& bias,

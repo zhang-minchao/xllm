@@ -787,6 +787,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre_sinkhorn(
 #endif
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> hc_pre(
+    HcPreParams& params) {
+#if defined(USE_NPU)
+  return npu::hc_pre(params.x,
+                     params.hc_fn,
+                     params.hc_scale,
+                     params.hc_base,
+                     params.hc_mult,
+                     params.hc_sinkhorn_iters,
+                     params.norm_eps,
+                     params.hc_eps);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> moe_gating_top_k_hash(
     MoeGatingTopKHashParams& params) {
 #if defined(USE_NPU)
