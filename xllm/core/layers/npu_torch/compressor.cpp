@@ -16,6 +16,7 @@ limitations under the License.
 #include "compressor.h"
 
 #include <glog/logging.h>
+
 #include <tuple>
 
 #if defined(USE_NPU)
@@ -27,20 +28,19 @@ limitations under the License.
 #endif
 
 #include "kernels/ops_api.h"
-#include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 DECLARE_bool(enable_chunked_prefill);
 namespace xllm {
 namespace layer {
 
 CompressorImpl::CompressorImpl(int64_t compress_ratio, int64_t head_dim)
-    : CompressorImpl(compress_ratio,
-                     head_dim,
-                     64,
-                     2,
-                     1e-6,
-                     torch::TensorOptions().dtype(torch::kFloat32).device(
-                         torch::kCPU)) {}
+    : CompressorImpl(
+          compress_ratio,
+          head_dim,
+          64,
+          2,
+          1e-6,
+          torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)) {}
 
 CompressorImpl::CompressorImpl(int64_t compress_ratio,
                                int64_t head_dim,
@@ -78,28 +78,30 @@ torch::Tensor CompressorImpl::forward(
 
   torch::Tensor compressed_kv;
   // TODO - replace opfunc; cu_seqlens/start_pos need Tensor from DSA metadata
+  xllm::kernel::CompressorParams params;
+  params.x = hidden_states;
+  params.wkv = cmp_wkv_;
+  params.wgate = cmp_wgate_;
+  params.kv_state = kv_state;
+  params.score_state = score_state;
+  params.ape = cmp_ape_;
+  params.norm_weight = cmp_norm_;
+  params.rope_sin = compressed_sin.view({-1, sin_last_dim});
+  params.rope_cos = compressed_cos.view({-1, cos_last_dim});
+  params.kv_block_table = c10::optional<torch::Tensor>(kv_block_table);
+  params.score_block_table = c10::optional<torch::Tensor>(score_block_table);
+  params.cu_seqlens = c10::optional<torch::Tensor>(actual_seq_lengths_query);
+  params.seqused = c10::nullopt;
+  params.start_pos = c10::optional<torch::Tensor>(attn_metadata.start_pos);
+  params.rope_head_dim = rope_head_dim_;
+  params.cmp_ratio = compress_ratio_;
+  params.coff = enable_compressor_overlap_ ? 2 : 1;
+  params.norm_eps = eps_;
+  params.rotary_mode = rot_mode_;
+  params.enable_grad = false;
+
   std::tie(compressed_kv, std::ignore, std::ignore, std::ignore, std::ignore) =
-      xllm::kernel::npu::compressor(
-          hidden_states,
-          cmp_wkv_,
-          cmp_wgate_,
-          kv_state,
-          score_state,
-          cmp_ape_,
-          cmp_norm_,
-          compressed_sin.view({-1, sin_last_dim}),
-          compressed_cos.view({-1, cos_last_dim}),
-          c10::optional<torch::Tensor>(kv_block_table),
-          c10::optional<torch::Tensor>(score_block_table),
-          c10::optional<torch::Tensor>(actual_seq_lengths_query),  // cu_seqlens
-          c10::nullopt,                                            // seqused
-          c10::optional<torch::Tensor>(attn_metadata.start_pos),   // start_pos
-          rope_head_dim_,
-          compress_ratio_,
-          enable_compressor_overlap_ ? 2 : 1,
-          eps_,
-          rot_mode_,
-          false);
+      xllm::kernel::compressor(params);
   return compressed_kv;
 }
 
@@ -146,9 +148,8 @@ void CompressorImpl::load_state_dict(const StateDict& state_dict) {
       << ", actual: " << cmp_norm_.device();
 
   auto coff = enable_compressor_overlap_ ? 2 : 1;
-  cmp_ape_ = torch::empty(
-      {compress_ratio_, coff * head_dim_},
-      options_.dtype(torch::kFloat32));
+  cmp_ape_ = torch::empty({compress_ratio_, coff * head_dim_},
+                          options_.dtype(torch::kFloat32));
   CHECK_EQ(cmp_ape_.device(), options_.device())
       << "cmp_ape device mismatch, expected: " << options_.device()
       << ", actual: " << cmp_ape_.device();

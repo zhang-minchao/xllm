@@ -21,7 +21,6 @@ limitations under the License.
 #include <limits>
 #include <vector>
 
-#include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "kernels/ops_api.h"
 
 namespace xllm {
@@ -368,27 +367,32 @@ torch::Tensor DeepseekV4IndexerImpl::select_qli(
     metadata_opt = qli_metadata.value();
   }
 
+  xllm::kernel::QuantLightningIndexerParams qli_params;
+  qli_params.query = q_quant;
+  qli_params.key = index_cache;
+  qli_params.weights = weights.to(torch::kFloat16);
+  qli_params.query_dequant_scale = q_scale;
+  qli_params.key_dequant_scale = key_dequant_scale;
+  qli_params.query_quant_mode = 0;
+  qli_params.key_quant_mode = 0;
+  qli_params.actual_seq_lengths_query =
+      c10::optional<torch::Tensor>(query_seq_lens);
+  qli_params.actual_seq_lengths_key =
+      c10::optional<torch::Tensor>(key_seq_lens);
+  qli_params.block_table =
+      c10::optional<torch::Tensor>(attn_metadata.block_table);
+  qli_params.metadata = metadata_opt;
+  qli_params.layout_query = "TND";
+  qli_params.layout_key = "PA_BSND";
+  qli_params.sparse_count = index_topk_;
+  qli_params.sparse_mode = 3;
+  qli_params.pre_tokens = std::numeric_limits<int64_t>::max();
+  qli_params.next_tokens = std::numeric_limits<int64_t>::max();
+  qli_params.cmp_ratio = compress_ratio_;
+  qli_params.return_value = false;
+
   auto [topk_indices, sparse_values] =
-      xllm::kernel::npu::quant_lightning_indexer(
-          q_quant,
-          index_cache,
-          weights.to(torch::kFloat16),
-          q_scale,
-          key_dequant_scale,
-          /*query_quant_mode=*/0,
-          /*key_quant_mode=*/0,
-          c10::optional<torch::Tensor>(query_seq_lens),
-          c10::optional<torch::Tensor>(key_seq_lens),
-          c10::optional<torch::Tensor>(attn_metadata.block_table),
-          metadata_opt,
-          /*layout_query=*/"TND",
-          /*layout_key=*/"PA_BSND",
-          /*sparse_count=*/index_topk_,
-          /*sparse_mode=*/3,
-          /*pre_tokens=*/std::numeric_limits<int64_t>::max(),
-          /*next_tokens=*/std::numeric_limits<int64_t>::max(),
-          /*cmp_ratio=*/compress_ratio_,
-          /*return_value=*/false);
+      xllm::kernel::quant_lightning_indexer(qli_params);
   (void)sparse_values;
 
   (void)key_seq_lens;

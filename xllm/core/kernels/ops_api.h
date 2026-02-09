@@ -90,4 +90,32 @@ void fused_indexer_q(FusedIndexerQParams& params);
 
 void fused_indexer_k(FusedIndexerKParams& params);
 
+torch::Tensor hc_post(HcPostParams& params);
+
+std::tuple<torch::Tensor, torch::Tensor> quant_lightning_indexer(
+    QuantLightningIndexerParams& params);
+
+torch::Tensor hc_pre_inv_rms(HcPreInvRmsParams& params);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> moe_gating_top_k_hash(
+    MoeGatingTopKHashParams& params);
+
+std::tuple<torch::Tensor, torch::Tensor> sparse_attn_sharedkv(
+    SparseAttnSharedkvParams& params);
+
+torch::Tensor sparse_flash_attention(SparseFlashAttentionParams& params);
+
+std::tuple<torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor,
+           torch::Tensor>
+compressor(CompressorParams& params);
+
+torch::Tensor quant_lightning_indexer_metadata(
+    QuantLightningIndexerMetadataParams& params);
+
+torch::Tensor sparse_attn_sharedkv_metadata(
+    SparseAttnSharedkvMetadataParams& params);
+
 }  // namespace xllm::kernel
