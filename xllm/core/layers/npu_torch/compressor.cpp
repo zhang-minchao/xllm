@@ -109,6 +109,10 @@ void CompressorImpl::load_state_dict(const StateDict& state_dict) {
   const auto wkv = state_dict.get_tensor("wkv.weight");
   const auto wgate = state_dict.get_tensor("wgate.weight");
   const auto norm = state_dict.get_tensor("norm.weight");
+  auto ape = state_dict.get_tensor("ape");
+  if (!ape.defined()) {
+    ape = state_dict.get_tensor("ape.weight");
+  }
 
   CHECK(wkv.defined()) << "missing weight: " << state_dict.prefix()
                        << "wkv.weight";
@@ -116,10 +120,22 @@ void CompressorImpl::load_state_dict(const StateDict& state_dict) {
                          << "wgate.weight";
   CHECK(norm.defined()) << "missing weight: " << state_dict.prefix()
                         << "norm.weight";
+  CHECK(ape.defined()) << "missing weight: " << state_dict.prefix()
+                       << "ape (or ape.weight)";
+
+  auto coff = enable_compressor_overlap_ ? 2 : 1;
+  CHECK_EQ(ape.dim(), 2) << "ape weight dim should be 2, but got " << ape.dim();
+  CHECK_EQ(ape.size(0), compress_ratio_)
+      << "ape weight size mismatch on dim0, expected " << compress_ratio_
+      << " but got " << ape.size(0);
+  CHECK_EQ(ape.size(1), coff * head_dim_)
+      << "ape weight size mismatch on dim1, expected " << (coff * head_dim_)
+      << " but got " << ape.size(1);
 
   cmp_wkv_ = wkv.to(options_);
   cmp_wgate_ = wgate.to(options_);
   cmp_norm_ = norm.to(options_);
+  cmp_ape_ = ape.to(options_.dtype(torch::kFloat32));
 
   CHECK(cmp_wkv_.defined()) << "cmp_wkv is undefined before format cast";
   CHECK(cmp_wgate_.defined()) << "cmp_wgate is undefined before format cast";
@@ -146,10 +162,6 @@ void CompressorImpl::load_state_dict(const StateDict& state_dict) {
   CHECK_EQ(cmp_norm_.device(), options_.device())
       << "cmp_norm device mismatch, expected: " << options_.device()
       << ", actual: " << cmp_norm_.device();
-
-  auto coff = enable_compressor_overlap_ ? 2 : 1;
-  cmp_ape_ = torch::empty({compress_ratio_, coff * head_dim_},
-                          options_.dtype(torch::kFloat32));
   CHECK_EQ(cmp_ape_.device(), options_.device())
       << "cmp_ape device mismatch, expected: " << options_.device()
       << ", actual: " << cmp_ape_.device();
