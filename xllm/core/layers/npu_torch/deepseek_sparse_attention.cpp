@@ -296,6 +296,8 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
   qk_head_dim_ = nope_head_dim_ + rope_head_dim_;
 
   const int64_t tp_size = parallel_args.tp_group_->world_size();
+  tp_rank_ = parallel_args.tp_group_->rank();
+  tp_size_ = tp_size;
   int64_t hidden_size = args.hidden_size();
   int64_t num_heads = args.n_heads();
 
@@ -305,6 +307,11 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
       << "num_heads must be divisible by tensor parallel size";
   n_local_heads_ = num_heads / tp_size;
   n_local_groups_ = o_groups_ / tp_size;
+
+  attn_sink_ = register_parameter(
+      "attn_sink",
+      torch::zeros({n_local_heads_}, options.dtype(torch::kFloat32)),
+      /*requires_grad=*/false);
 
   q_a_proj_ = register_module(
       "q_a_proj",
@@ -582,7 +589,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       c10::nullopt,
       c10::nullopt,
       as_optional(attn_metadata.actual_seq_lengths_kv),
-      c10::nullopt,
+      attn_sink_loaded_ ? as_optional(attn_sink_) : c10::nullopt,
       sparse_metadata,
       softmax_scale_,
       compress_ratio_i,
@@ -619,6 +626,31 @@ void DSAttentionImpl::load_state_dict(const StateDict& state_dict) {
   kv_layernorm_->load_state_dict(state_dict.get_dict_with_prefix("kv_norm."));
   o_a_proj_->load_state_dict(state_dict.get_dict_with_prefix("wo_a."));
   o_b_proj_->load_state_dict(state_dict.get_dict_with_prefix("wo_b."));
+
+  auto attn_sink = state_dict.get_tensor("attn_sink");
+  if (!attn_sink.defined()) {
+    attn_sink = state_dict.get_tensor("attn_sink.weight");
+  }
+  if (attn_sink.defined()) {
+    if (attn_sink.dim() == 1 && attn_sink.size(0) == num_heads_ &&
+        tp_size_ > 1) {
+      CHECK_EQ(num_heads_ % tp_size_, 0)
+          << "attn_sink full-head tensor size is not divisible by tp_size.";
+      const int64_t shard_size = num_heads_ / tp_size_;
+      const int64_t shard_start = tp_rank_ * shard_size;
+      attn_sink = attn_sink.slice(/*dim=*/0,
+                                  /*start=*/shard_start,
+                                  /*end=*/shard_start + shard_size);
+    }
+
+    CHECK(attn_sink.dim() == 1 && attn_sink.size(0) == n_local_heads_)
+        << "attn_sink shape mismatch, expected [" << n_local_heads_ << "], got "
+        << attn_sink.sizes();
+
+    torch::NoGradGuard no_grad;
+    attn_sink_.copy_(attn_sink.to(attn_sink_.device()).to(attn_sink_.dtype()));
+    attn_sink_loaded_ = true;
+  }
 
   if (compressor_ && compress_ratio_ >= 4) {
     compressor_->load_state_dict(

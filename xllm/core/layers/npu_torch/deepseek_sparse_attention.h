@@ -89,6 +89,8 @@ class DSAttentionImpl : public torch::nn::Module {
   double eps_ = 1e-6;
   int64_t qk_head_dim_;
   int64_t n_local_groups_;
+  int64_t tp_rank_ = 0;
+  int64_t tp_size_ = 1;
   int64_t index_n_heads_ = 0;
   int64_t index_head_dim_ = 0;
   int64_t index_topk_ = 0;
@@ -105,6 +107,9 @@ class DSAttentionImpl : public torch::nn::Module {
 
   ColumnParallelLinear o_a_proj_{nullptr};
   RowParallelLinear o_b_proj_{nullptr};
+
+  torch::Tensor attn_sink_;
+  bool attn_sink_loaded_ = false;
 
   Attention attn_{nullptr};
   DeepseekScalingRotaryEmbedding rotary_emb_{nullptr};
