@@ -159,7 +159,7 @@ class DeepseekV4ModelImpl
     }
 
     for (int32_t i = 0; i < model_args.n_layers(); ++i) {
-      auto layer = layer::DeepseekV4DecoderLayer(context);
+      auto layer = layer::DeepseekV4DecoderLayer(context, i);
       layers_.push_back(layer);
     }
 

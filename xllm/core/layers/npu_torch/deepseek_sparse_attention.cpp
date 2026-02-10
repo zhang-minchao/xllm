@@ -263,16 +263,18 @@ AttentionMetadata build_indexer_attention_metadata(
 
 }  // namespace
 
-DSAttentionImpl::DSAttentionImpl(const ModelContext& context)
+DSAttentionImpl::DSAttentionImpl(const ModelContext& context, int32_t layer_id)
     : DSAttentionImpl(context.get_model_args(),
                       context.get_quant_args(),
                       context.get_parallel_args(),
-                      context.get_tensor_options()) {}
+                      context.get_tensor_options(),
+                      layer_id) {}
 
 DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
                                  const QuantArgs& quant_args,
                                  const ParallelArgs& parallel_args,
-                                 const torch::TensorOptions& options)
+                                 const torch::TensorOptions& options,
+                                 int32_t layer_id)
     : num_heads_(args.n_heads()),
       head_size_(args.head_dim()),
       head_dim_(args.head_dim()),
@@ -283,13 +285,27 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
       o_groups_(args.o_groups()),
       rope_head_dim_(args.rope_head_dim()),
       window_size_(args.window_size()),
-      compress_ratio_(args.compress_ratios().empty()
-                          ? 1.0
-                          : static_cast<double>(args.compress_ratios()[0])),
+      compress_ratio_(1.0),
       index_n_heads_(args.index_n_heads()),
       index_head_dim_(args.index_head_dim()),
       index_topk_(args.index_topk()),
       eps_(args.rms_norm_eps()) {
+  const auto& compress_ratios = args.compress_ratios();
+  CHECK(!compress_ratios.empty())
+      << "DSAttention requires non-empty compress_ratios for DeepSeek V4";
+  CHECK_GE(layer_id, 0) << "DSAttention requires valid layer_id, got "
+                        << layer_id;
+  CHECK_LT(layer_id, static_cast<int32_t>(compress_ratios.size()))
+      << "DSAttention layer_id " << layer_id << " exceeds compress_ratios size "
+      << compress_ratios.size();
+  int64_t compress_ratio = compress_ratios[static_cast<size_t>(layer_id)];
+
+  CHECK(compress_ratio == 1 || compress_ratio == 4 || compress_ratio == 128)
+      << "DSAttention unsupported compress_ratio " << compress_ratio
+      << " at layer " << layer_id;
+
+  compress_ratio_ = static_cast<double>(compress_ratio);
+
   softmax_scale_ = std::pow(head_dim_, static_cast<double>(-0.5));
   scale_ = static_cast<float>(softmax_scale_);
   nope_head_dim_ = head_dim_ - rope_head_dim_;

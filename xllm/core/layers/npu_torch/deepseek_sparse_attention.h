@@ -48,11 +48,12 @@ using KVState = std::tuple<torch::Tensor,
 class DSAttentionImpl : public torch::nn::Module {
  public:
   DSAttentionImpl() = default;
-  DSAttentionImpl(const ModelContext& context);
+  DSAttentionImpl(const ModelContext& context, int32_t layer_id = -1);
   DSAttentionImpl(const ModelArgs& args,
                   const QuantArgs& quant_args,
                   const ParallelArgs& parallel_args,
-                  const torch::TensorOptions& options);
+                  const torch::TensorOptions& options,
+                  int32_t layer_id = -1);
 
   std::tuple<torch::Tensor, std::optional<torch::Tensor>> forward(
       const DSAMetadata& attn_metadata,

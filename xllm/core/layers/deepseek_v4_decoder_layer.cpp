@@ -23,7 +23,12 @@ namespace xllm {
 namespace layer {
 
 DeepseekV4DecoderLayerImpl::DeepseekV4DecoderLayerImpl(
-    const ModelContext& context) {
+    const ModelContext& context)
+    : DeepseekV4DecoderLayerImpl(context, /*layer_id=*/-1) {}
+
+DeepseekV4DecoderLayerImpl::DeepseekV4DecoderLayerImpl(
+    const ModelContext& context,
+    int32_t layer_id) {
   const auto& args = context.get_model_args();
   const auto& quant_args = context.get_quant_args();
   const auto& parallel_args = context.get_parallel_args();
@@ -46,7 +51,7 @@ DeepseekV4DecoderLayerImpl::DeepseekV4DecoderLayerImpl(
   hc_eps_ = static_cast<double>(args.hc_eps());
   norm_eps_ = static_cast<double>(args.rms_norm_eps());
 
-  attention_ = register_module("attn", DSAttention(context));
+  attention_ = register_module("attn", DSAttention(context, layer_id));
   attn_norm_ = register_module(
       "attn_norm", RMSNorm(hidden_size, args.rms_norm_eps(), options));
   ffn_norm_ = register_module(

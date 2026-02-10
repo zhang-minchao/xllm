@@ -36,6 +36,8 @@ namespace layer {
 class DeepseekV4DecoderLayerImpl : public torch::nn::Module {
  public:
   explicit DeepseekV4DecoderLayerImpl(const ModelContext& context);
+  explicit DeepseekV4DecoderLayerImpl(const ModelContext& context,
+                                      int32_t layer_id);
 
   void load_state_dict(const StateDict& state_dict);
 
