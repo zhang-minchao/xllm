@@ -23,6 +23,7 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
+#include "kernels/ops_api.h"
 #include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 DECLARE_bool(enable_chunked_prefill);
@@ -389,6 +390,12 @@ DSAttentionImpl::DSAttentionImpl(const ModelArgs& args,
     }
   }
 
+  q_rms_gamma_ = register_buffer("q_rms_gamma",
+                                 torch::ones({head_dim_},
+                                             torch::TensorOptions()
+                                                 .dtype(options.dtype())
+                                                 .device(options.device())));
+
   o_a_proj_ =
       register_module("o_a_proj",
                       ColumnParallelLinear(num_heads * head_dim_ / o_groups_,
@@ -431,7 +438,13 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   auto qr = std::get<0>(q_layernorm_->forward(q_down));
   auto q = q_b_proj_->forward(qr).view({-1, n_local_heads_, head_dim_});
 
-  q = q * torch::rsqrt(q.square().mean(-1, true) + static_cast<float>(eps_));
+  xllm::kernel::FusedLayerNormParams q_rmsnorm_params;
+  q_rmsnorm_params.input = q;
+  q_rmsnorm_params.weight = q_rms_gamma_;
+  q_rmsnorm_params.mode = "rmsnorm";
+  q_rmsnorm_params.eps = eps_;
+  xllm::kernel::fused_layernorm(q_rmsnorm_params);
+  q = q_rmsnorm_params.output;
 
   // 2) kv projection
   auto kv_down = kv_proj_->forward(hidden_states);

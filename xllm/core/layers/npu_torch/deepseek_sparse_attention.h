@@ -116,6 +116,8 @@ class DSAttentionImpl : public torch::nn::Module {
   DeepseekScalingRotaryEmbedding rotary_emb_{nullptr};
   DeepseekV4Indexer indexer_{nullptr};
   Compressor compressor_{nullptr};
+
+  torch::Tensor q_rms_gamma_;
 };
 TORCH_MODULE(DSAttention);
 
