@@ -30,6 +30,10 @@ class ExtBuild(build_ext):
         ("device=", None, "target device type (a3 or a2 or mlu or cuda or musa)"),
         ("arch=", None, "target arch type (x86 or arm)"),
         ("install-xllm-kernels=", None, "install xllm_kernels RPM package (true/false)"),
+        # Temporary switch: xllm_ops integration changes are not fully merged yet.
+        # This allows disabling xllm_ops precompile to avoid overwriting
+        # pre-provisioned xllm_ops artifacts during local rebuilds.
+        ("precompile-xllm-ops=", None, "run third_party/xllm_ops/build.sh (true/false)"),
         ("generate-so=", None, "generate so or binary"),
     ]
 
@@ -39,6 +43,7 @@ class ExtBuild(build_ext):
         self.device: Optional[str] = None
         self.arch: Optional[str] = None
         self.install_xllm_kernels: Optional[bool] = None
+        self.precompile_xllm_ops: Optional[bool] = None
         self.generate_so: bool = False
 
     def finalize_options(self) -> None:
@@ -110,6 +115,7 @@ class ExtBuild(build_ext):
             f"-DDEVICE_TYPE=USE_{self.device.upper()}",
             f"-DDEVICE_ARCH={self.arch.upper()}",
             f"-DINSTALL_XLLM_KERNELS={'ON' if self.install_xllm_kernels else 'OFF'}",
+            f"-DPRECOMPILE_XLLM_OPS={'ON' if self.precompile_xllm_ops else 'OFF'}",
             f"-DCMAKE_JOB_POOLS=archive={archive_jobs}",
         ]
 
@@ -462,6 +468,7 @@ class BuildTest(Command):
         ("device=", None, "target device type (a3 or a2 or mlu or cuda or ilu)"),
         ("arch=", None, "target arch type (x86 or arm)"),
         ("install-xllm-kernels=", None, "install xllm_kernels RPM package (true/false)"),
+        ("precompile-xllm-ops=", None, "run third_party/xllm_ops/build.sh (true/false)"),
         ("generate-so=", None, "generate so or binary"),
     ]
 
@@ -470,6 +477,7 @@ class BuildTest(Command):
         self.device: Optional[str] = None
         self.arch: Optional[str] = None
         self.install_xllm_kernels: Optional[bool] = None
+        self.precompile_xllm_ops: Optional[bool] = None
         self.generate_so: bool = False
 
     def finalize_options(self) -> None:
@@ -484,6 +492,7 @@ class BuildTest(Command):
         build_ext.device = self.device
         build_ext.arch = self.arch
         build_ext.install_xllm_kernels = self.install_xllm_kernels
+        build_ext.precompile_xllm_ops = self.precompile_xllm_ops
         build_ext.generate_so = self.generate_so
         build_ext.finalize_options()
         
@@ -529,6 +538,17 @@ def parse_arguments() -> dict[str, Any]:
         default='true',
         help='Whether to install xllm kernels'
     )
+
+    # Temporary switch: xllm_ops integration changes are not fully merged yet.
+    # This allows disabling xllm_ops precompile to avoid overwriting
+    # pre-provisioned xllm_ops artifacts during local rebuilds.
+    parser.add_argument(
+        '--precompile-xllm-ops',
+        type=str.lower,
+        choices=['true', 'false', '1', '0', 'yes', 'no', 'y', 'n', 'on', 'off'],
+        default='true',
+        help='Whether to run xllm_ops precompile script'
+    )
     
     parser.add_argument(
         '--generate-so',
@@ -550,12 +570,14 @@ def parse_arguments() -> dict[str, Any]:
     sys.argv = [sys.argv[0]] + args.setup_args
     
     install_kernels = args.install_xllm_kernels.lower() in ('true', '1', 'yes', 'y', 'on')
+    precompile_xllm_ops = args.precompile_xllm_ops.lower() in ('true', '1', 'yes', 'y', 'on')
     generate_so = args.generate_so.lower() in ('true', '1', 'yes', 'y', 'on')
 
     return {
         'device': args.device,
         'dry_run': args.dry_run,
         'install_xllm_kernels': install_kernels,
+        'precompile_xllm_ops': precompile_xllm_ops,
         'generate_so': generate_so,
         'test_name': args.test_name,
     }
@@ -573,6 +595,7 @@ if __name__ == "__main__":
         pre_build(device)
 
     install_kernels = config['install_xllm_kernels']
+    precompile_xllm_ops = config['precompile_xllm_ops']
     generate_so = config['generate_so']
     test_name = config.get('test_name')
 
@@ -622,12 +645,14 @@ if __name__ == "__main__":
                     'device': device,
                     'arch': arch,
                     'install_xllm_kernels': install_kernels,
+                    'precompile_xllm_ops': precompile_xllm_ops,
                     'generate_so': generate_so
                     },
                  'build_test': {
                     'device': device,
                     'arch': arch,
                     'install_xllm_kernels': install_kernels,
+                    'precompile_xllm_ops': precompile_xllm_ops,
                     'generate_so': generate_so,
                     'test_name': test_name,
                     },

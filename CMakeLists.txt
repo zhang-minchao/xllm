@@ -56,27 +56,36 @@ if(USE_NPU)
       file(WRITE "${CMAKE_BINARY_DIR}/.xllm_installed" "")
   endif()
 
-  execute_process(
-    COMMAND git -C "${CMAKE_SOURCE_DIR}/third_party/xllm_ops" rev-parse HEAD
-    OUTPUT_VARIABLE XLLM_OPS_GIT_HEAD
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-  )
-
-  if(NOT DEFINED XLLM_OPS_GIT_HEAD_CACHED OR NOT XLLM_OPS_GIT_HEAD STREQUAL XLLM_OPS_GIT_HEAD_CACHED)
-    message(STATUS "xllm_ops git HEAD changed; running precompile via execute_process")
+  # Temporary switch: xllm_ops integration changes are not fully merged yet.
+  # Keep this option so builds can skip xllm_ops precompile and avoid
+  # overwriting pre-provisioned xllm_ops artifacts in the environment.
+  option(PRECOMPILE_XLLM_OPS "Run xllm_ops precompile script" ON)
+  message(STATUS "PRECOMPILE_XLLM_OPS enabled: ${PRECOMPILE_XLLM_OPS}")
+  if(PRECOMPILE_XLLM_OPS)
     execute_process(
-      COMMAND bash ${CMAKE_SOURCE_DIR}/third_party/xllm_ops/build.sh
-      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/third_party/xllm_ops
-      RESULT_VARIABLE XLLM_OPS_RESULT
+      COMMAND git -C "${CMAKE_SOURCE_DIR}/third_party/xllm_ops" rev-parse HEAD
+      OUTPUT_VARIABLE XLLM_OPS_GIT_HEAD
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
     )
-    if(NOT XLLM_OPS_RESULT EQUAL 0)
-      message(FATAL_ERROR "Failed to precompile xllm ops, error code: ${XLLM_OPS_RESULT}")
+
+    if(NOT DEFINED XLLM_OPS_GIT_HEAD_CACHED OR NOT XLLM_OPS_GIT_HEAD STREQUAL XLLM_OPS_GIT_HEAD_CACHED)
+      message(STATUS "xllm_ops git HEAD changed; running precompile via execute_process")
+      execute_process(
+        COMMAND bash ${CMAKE_SOURCE_DIR}/third_party/xllm_ops/build.sh
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/third_party/xllm_ops
+        RESULT_VARIABLE XLLM_OPS_RESULT
+      )
+      if(NOT XLLM_OPS_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to precompile xllm ops, error code: ${XLLM_OPS_RESULT}")
+      endif()
+      set(XLLM_OPS_GIT_HEAD_CACHED "${XLLM_OPS_GIT_HEAD}" CACHE INTERNAL "" FORCE)
+      message(STATUS "xllm ops precompiled and HEAD cache updated")
+    else()
+      message(STATUS "xllm_ops git HEAD unchanged; skipping precompile")
     endif()
-    set(XLLM_OPS_GIT_HEAD_CACHED "${XLLM_OPS_GIT_HEAD}" CACHE INTERNAL "" FORCE)
-    message(STATUS "xllm ops precompiled and HEAD cache updated")
   else()
-    message(STATUS "xllm_ops git HEAD unchanged; skipping precompile")
+    message(STATUS "PRECOMPILE_XLLM_OPS disabled; skipping xllm_ops precompile")
   endif()
 endif()
 
