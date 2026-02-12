@@ -15,15 +15,16 @@ limitations under the License.
 #include "deepseek_sparse_attention.h"
 
 #include <glog/logging.h>
-#include <torch_npu/csrc/aten/CustomFunctions.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <tuple>
 #include <vector>
 
 #include "kernels/ops_api.h"
+#include "torch_npu_ops/triton_npu/torch_api/triton_ops_api.h"
 #include "xllm/core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 DECLARE_bool(enable_chunked_prefill);
@@ -120,28 +121,6 @@ DsaCacheMapping resolve_cache_mapping(const DSAMetadata& attn_metadata,
   return mapping;
 }
 
-torch::Tensor prepare_rope_cache(const torch::Tensor& cache,
-                                 const torch::Tensor& x,
-                                 bool negate) {
-  if (!cache.defined()) {
-    return torch::Tensor();
-  }
-  auto out = cache;
-  if (out.dim() == x.dim() - 1) {
-    out = out.unsqueeze(-2);
-  }
-  if (out.device() != x.device()) {
-    out = out.to(x.device());
-  }
-  if (out.dtype() != x.dtype()) {
-    out = out.to(x.dtype());
-  }
-  if (negate) {
-    out = -out;
-  }
-  return out.contiguous();
-}
-
 void apply_partial_rope(torch::Tensor& input,
                         int64_t rope_head_dim,
                         const torch::Tensor& cos,
@@ -157,19 +136,26 @@ void apply_partial_rope(torch::Tensor& input,
     return;
   }
 
-  auto input_nope = input.slice(-1, 0, input_last_dim - rope_head_dim);
-  auto input_pe =
-      input.slice(-1, input_last_dim - rope_head_dim, input_last_dim);
+  auto sin_cache = inverse ? -sin : sin;
+  auto cos_cache = cos;
+  CHECK(input.dim() == 2 || input.dim() == 3)
+      << "apply_partial_rope only supports input dim 2/3, got: " << input.dim();
+  CHECK(cos_cache.dim() == 2 && sin_cache.dim() == 2)
+      << "apply_partial_rope expects cos/sin dim=2, got cos dim "
+      << cos_cache.dim() << ", sin dim " << sin_cache.dim();
+  CHECK(cos_cache.size(0) == input.size(0) &&
+        sin_cache.size(0) == input.size(0))
+      << "apply_partial_rope expects cos/sin batch == input.size(0), got cos "
+      << cos_cache.size(0) << ", sin " << sin_cache.size(0) << ", input "
+      << input.size(0);
+  CHECK(cos_cache.size(1) == rope_head_dim &&
+        sin_cache.size(1) == rope_head_dim)
+      << "apply_partial_rope expects cos/sin last dim == rope_head_dim("
+      << rope_head_dim << "), got cos " << cos_cache.size(1) << ", sin "
+      << sin_cache.size(1);
 
-  auto cos_cache = prepare_rope_cache(cos, input_pe, /*negate=*/false);
-  auto sin_cache = prepare_rope_cache(sin, input_pe, /*negate=*/inverse);
-  if (!cos_cache.defined() || !sin_cache.defined()) {
-    return;
-  }
-
-  auto rotated = at_npu::native::custom_ops::npu_rotary_mul(
-      input_pe, cos_cache, sin_cache, "interleave");
-  input = torch::cat({input_nope, rotated}, -1);
+  xllm::kernel::npu::rope_inplace(
+      input, sin_cache, cos_cache, static_cast<uint32_t>(rope_head_dim));
 }
 
 void scatter_by_slot(torch::Tensor& cache,

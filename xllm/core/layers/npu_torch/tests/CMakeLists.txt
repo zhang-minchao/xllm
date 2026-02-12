@@ -20,8 +20,7 @@ target_link_libraries(npu_deepseek_v4_indexer_test
                       hccl
                       c_sec
                       nnopbase
-                      atb
-                      aclnn_ops_infer)
+                      atb)
 
 target_link_options(npu_deepseek_v4_indexer_test PRIVATE
   "-Wl,--whole-archive"

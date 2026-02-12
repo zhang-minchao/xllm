@@ -18,6 +18,7 @@ cc_library(
   DEPS
     :common_layers
     :xllm_ops
+    :triton_adapter
 )
 
 add_subdirectory(tests)

@@ -18,10 +18,12 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
 #include "kernels/ops_api.h"
+#include "torch_npu_ops/triton_npu/torch_api/triton_ops_api.h"
 
 namespace xllm {
 namespace layer {
@@ -85,42 +87,34 @@ torch::Tensor rotate_activation_with_hadamard(const torch::Tensor& x,
   return out;
 }
 
-torch::Tensor apply_partial_rope_fallback(
-    torch::Tensor q,
-    int64_t rope_head_dim,
-    const torch::Tensor& cos,
-    const torch::Tensor& sin,
-    const AttentionMetadata& attn_metadata,
-    bool decode_mode) {
+torch::Tensor apply_partial_rope(torch::Tensor q,
+                                 int64_t rope_head_dim,
+                                 const torch::Tensor& cos,
+                                 const torch::Tensor& sin) {
   if (rope_head_dim <= 0 || rope_head_dim > q.size(-1)) {
     return q;
   }
-  auto split_sizes =
-      std::vector<int64_t>{q.size(-1) - rope_head_dim, rope_head_dim};
-  auto q_split = q.split(split_sizes, -1);
-  auto q_nope = q_split[0];
-  auto q_pe = q_split[1];
 
-  auto rope = torch::empty_like(q_pe);
-  kernel::RotaryParams rope_params;
-  rope_params.q = q_pe;
-  rope_params.k = rope;
-  rope_params.sin = sin;
-  rope_params.cos = cos;
-  rope_params.cos_sin = torch::Tensor();
-  rope_params.position_ids = std::nullopt;
-  rope_params.cu_query_lens = attn_metadata.q_cu_seq_lens;
-  rope_params.interleaved = false;
-  rope_params.discrete = false;
-  rope_params.max_query_len = attn_metadata.max_query_len;
-  if (decode_mode) {
-    LOG_FIRST_N(WARNING, 1)
-        << "DeepseekV4Indexer decode RoPE uses fallback path. "
-        << "Please replace with triton_apply_rope_partial_in_place-equivalent "
-        << "implementation in xllm.";
-  }
-  xllm::kernel::apply_rotary(rope_params);
-  return torch::cat({q_nope, q_pe}, -1);
+  auto cos_cache = cos;
+  auto sin_cache = sin;
+  CHECK(q.dim() == 2 || q.dim() == 3)
+      << "apply_partial_rope only supports q dim 2/3, got: " << q.dim();
+  CHECK(cos_cache.dim() == 2 && sin_cache.dim() == 2)
+      << "apply_partial_rope expects cos/sin dim=2, got cos dim "
+      << cos_cache.dim() << ", sin dim " << sin_cache.dim();
+  CHECK(cos_cache.size(0) == q.size(0) && sin_cache.size(0) == q.size(0))
+      << "apply_partial_rope expects cos/sin batch == q.size(0), got cos "
+      << cos_cache.size(0) << ", sin " << sin_cache.size(0) << ", q "
+      << q.size(0);
+  CHECK(cos_cache.size(1) == rope_head_dim &&
+        sin_cache.size(1) == rope_head_dim)
+      << "apply_partial_rope expects cos/sin last dim == rope_head_dim("
+      << rope_head_dim << "), got cos " << cos_cache.size(1) << ", sin "
+      << sin_cache.size(1);
+
+  xllm::kernel::npu::rope_inplace(
+      q, sin_cache, cos_cache, static_cast<uint32_t>(rope_head_dim));
+  return q;
 }
 
 std::tuple<torch::Tensor, torch::Tensor> dynamic_quant_int8(
@@ -276,14 +270,10 @@ torch::Tensor DeepseekV4IndexerImpl::select_qli(
   CHECK(index_cache.defined())
       << "DeepseekV4Indexer::select_qli: index_cache is undefined";
 
+  (void)with_prefill;
   auto q = build_query(qr);
   if (cos.has_value() && sin.has_value()) {
-    q = apply_partial_rope_fallback(q,
-                                    rope_head_dim_,
-                                    cos.value(),
-                                    sin.value(),
-                                    attn_metadata,
-                                    !with_prefill);
+    q = apply_partial_rope(q, rope_head_dim_, cos.value(), sin.value());
   }
   auto hadamard = get_hadamard_matrix(attn_metadata, hadamard_matrix_);
   q = rotate_activation_with_hadamard(q, hadamard, hadamard_scale_);
