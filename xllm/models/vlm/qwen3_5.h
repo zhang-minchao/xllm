@@ -222,11 +222,7 @@ class Qwen3_5ModelImpl final
                                         attn_metadata.is_dummy,
                                         h.device());
 #else
-      if (params.attention.device.kv_cache_tokens_nums.defined() &&
-          params.attention.device.kv_cache_tokens_nums.numel() > 0) {
-        attn_metadata.has_initial_states =
-            (params.attention.device.kv_cache_tokens_nums > 0).to(torch::kBool);
-      } else {
+      if (!attn_metadata.has_initial_states.defined()) {
         attn_metadata.has_initial_states =
             torch::zeros({seqlens.size(0)},
                          torch::dtype(torch::kBool).device(seqlens.device()));
