@@ -52,26 +52,19 @@ inline torch::Tensor materialize_linear_state_mask(
                        torch::dtype(torch::kBool).device(device));
 }
 
-// Apply each op's restore plan in-place: copy `restore_src_slot_id` into
-// `linear_state_id` across every linear-attention layer present in
-// `kv_caches`, then record each op's outcome into `validity_mask`. The
-// caller sizes `validity_mask` to the active batch and pre-fills it with
-// the kv-cache default; this helper only overrides the entries it must:
-//   - RESTORED:  a checkpoint was copied into the live slot -> set 1 (warm).
-//   - COLD_START: a restore was requested but the checkpoint was unavailable
-//     (miss / out-of-range / copy failure) -> set 0, so the forward does not
-//     treat reused kv blocks as warm recurrent state.
-//   - no restore requested (continued request / no prefix reused) -> left
-//     untouched, so warm continued requests keep the kv-cache default.
-// Slot ownership and LRU eviction live in the scheduler-side
-// LinearStateBlockManager; this helper is purely the worker-side restore copy
-// that cache dictates. Saves require no worker-side copy and are handled by
-// promotion in the scheduler, so this API only covers restores. Copies are
-// enqueued on whichever stream is current at the call site (today this is the
-// worker's dedicated `prepare_stream_`, not the default model-forward stream);
-// the caller is responsible for inserting a stream-event barrier before the
-// model forward consumes the restored slots — see worker_impl.cpp where
-// prepare_stream.record_event() is awaited prior to the forward.
+// Apply each sequence's recurrent-state initialization plan in place. Fresh
+// sequences clear their live slot, restored sequences copy a resolved
+// checkpoint into it, and continued sequences preserve it. The caller derives
+// `validity_mask` from context lengths before this call; this function
+// corrects entries after clear/copy operations have been enqueued.
+//
+// Slot 0 is reserved for null/padding rows and is never a valid live or source
+// slot. A malformed restore descriptor or cache layout is fatal: continuing
+// with a reused full-attention KV prefix but missing recurrent state would
+// produce semantically inconsistent output.
+//
+// Operations run on the current stream. The caller must preserve stream order
+// before model forward consumes the restored slots.
 void restore_linear_state_slots(
     std::vector<KVCache>& kv_caches,
     const std::vector<LinearStateCacheOp>& cache_ops,

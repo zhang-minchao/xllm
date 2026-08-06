@@ -186,6 +186,30 @@ AttentionMetadata build_attention_metadata(
   attn_metadata.is_prefill = params.meta.batch_forward_type.is_prefill();
   attn_metadata.prefill_without_cache = params.prefill_without_cache;
 
+  const bool needs_initial_state =
+      attn_metadata.is_prefill || attn_metadata.is_chunked_prefill;
+  if (needs_initial_state && !params.parallel.has_initial_state.empty()) {
+    torch::TensorOptions options =
+        int32_options_like(params.attention.device.kv_cache_tokens_nums,
+                           params.embedding.linear_state_indices)
+            .dtype(torch::kBool);
+    if (!params.attention.device.kv_cache_tokens_nums.defined() &&
+        !params.embedding.linear_state_indices.defined() &&
+        device.has_value()) {
+      options = options.device(device.value());
+    }
+    attn_metadata.has_initial_states =
+        torch::tensor(params.parallel.has_initial_state, options);
+  } else if (needs_initial_state &&
+             params.attention.device.kv_cache_tokens_nums.defined() &&
+             params.attention.device.kv_cache_tokens_nums.numel() > 0) {
+    // Direct model/test inputs may bypass worker preparation. Preserve their
+    // context-length-derived semantics, but never override worker-corrected
+    // metadata after a physical reset or restore.
+    attn_metadata.has_initial_states =
+        (params.attention.device.kv_cache_tokens_nums > 0).to(torch::kBool);
+  }
+
   // MLA-family MLU paths require per-sequence q/kv lengths during prefill.
   if (!attn_metadata.is_prefill || enable_mla) {
     attn_metadata.block_table = params.attention.device.block_tables;
@@ -233,12 +257,20 @@ AttentionMetadata build_attention_metadata(
              "undefined";
       options = options.device(device.value());
     }
-    attn_metadata.slot_mapping = torch::tensor({1}, options);
+    attn_metadata.slot_mapping = torch::tensor({0}, options);
     attn_metadata.q_cu_seq_lens = torch::tensor({0, 1}, options);
+    attn_metadata.kv_cu_seq_lens = torch::tensor({0, 1}, options);
     attn_metadata.q_seq_lens = torch::tensor({1}, options);
     attn_metadata.kv_seq_lens = torch::tensor({1}, options);
+    attn_metadata.q_seq_lens_vec = {0, 1};
+    attn_metadata.kv_seq_lens_vec = {0, 1};
+    attn_metadata.paged_kv_indptr = torch::tensor({0, 1}, options);
+    attn_metadata.paged_kv_indices = torch::tensor({0}, options);
+    attn_metadata.paged_kv_last_page_len = torch::tensor({1}, options);
+    attn_metadata.block_table = torch::zeros({1, 1}, options);
     attn_metadata.max_query_len = 1;
     attn_metadata.max_seq_len = std::max<int64_t>(attn_metadata.max_seq_len, 1);
+    attn_metadata.total_kv_len = 1;
   }
 
   // Set is_causal: true for prefill (causal attention), false for decode
